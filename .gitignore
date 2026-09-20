@@ -1,0 +1,22 @@
+# build output
+*.obj
+*.exe
+*.pdb
+*.ilk
+obj/
+bin/
+build/
+
+# runtime artifacts produced by the supervisor and by the tests
+logs/
+tests/run/
+tests/sup.pid
+*.log
+
+# editors / OS
+.vs/
+.idea/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store
