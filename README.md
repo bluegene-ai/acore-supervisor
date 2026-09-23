@@ -248,6 +248,15 @@ The driver resolves the supervisor binary relative to the repository
 (`..\..\release\supervisor\acore_supervisor.exe`), so pass `-SupervisorExe` when yours lives
 elsewhere. All scenarios pass.
 
+`run_scenario.ps1` cleans up and counts `worldserver` / `authserver` processes **by name**, so it
+must not run on a machine that is currently serving players. Two incidents also have their own
+focused regression test, which can be pointed at any binary with `-SupervisorExe`:
+
+| test | incident |
+|---|---|
+| `tests\run_adopt_test.ps1` | 1.1.1 - an adopted process that survived the stop was restarted next to the survivor |
+| `tests\run_stale_log_test.ps1` | 1.1.4 - a fresh process was declared "started" from the previous run's log lines |
+
 Panel-side verification: `php tools/verify_supervisor.php` (50 checks: path auto-detection,
 status parsing, health mapping, staleness, command validation, atomic write, log tail, page
 rendering, navigation/asset registration, base-path handling, API answers) plus `php -l` on
@@ -347,6 +356,44 @@ answer as `short auth response (N byte)`, and the fail code is read from the thi
 Verified on this deployment against the real `authserver.exe` of rev `2c4fe4c32f0b+` (build 12340):
 the old packet gets `recv() == 0` - the peer closes with no reply - and the fixed packet gets
 `00 00 04`. `tests\run_scenario.ps1` (all scenarios) and `--once` pass afterwards.
+
+### Also in 1.1.4: a started server is judged only by the lines it writes
+
+`StartServiceProcess()` reset the log read offset to 0, so the FIRST health check of a freshly
+launched server read the whole pre-existing log - including the lines of the run before it:
+
+```
+[17:57:36] [worldserver] started pid 4732 ...
+[17:57:38] [OK   ] [worldserver] pid 4732 finished startup after 1s; health rule: world-loop heartbeat
+```
+
+That server needed 19 seconds (`WORLD: World Initialized In 0 Minutes 19 Seconds`): the "ready"
+came from the **previous** run's `World Initialized In` line, and the previous run's
+`Update time diff:` lines were taken as heartbeats too. Consequences: a misleading startup time in
+the log, and the `StartupTimeoutSeconds` / `StartupStallSeconds` guards never protecting a server
+that hangs during startup (the heartbeat rule caught it later instead).
+
+1.1.4 captures where the log ends right after `CreateProcess` and reads only what the new process
+appends. A size comparison alone cannot tell "appended" from "truncated and already regrown past
+the old size", so the captured offset also carries a 32 byte fingerprint of the bytes in front of
+it: if those bytes are no longer there, the file was rewritten and the scan starts from 0.
+AzerothCore's default `Appender.*=...,w` truncates at startup, and that path is explicitly kept
+working - `tests\run_stale_log_test.ps1` asserts both halves:
+
+| phase | setup | expected |
+|---|---|---|
+| A | a fresh process that writes **nothing** while the log still holds the previous run's ready + heartbeat lines | not reported as started; `startup did not finish within 6s` fires |
+| B | a truncating appender (mode `w`) that writes its own log | startup is recognised, and only after the fresh line really appeared (`finished startup after 4s`) |
+
+```
+pwsh -File tests\run_stale_log_test.ps1                 # 10 checks, both phases
+pwsh -File tests\run_stale_log_test.ps1 -KeepArtifacts  # keep tests\run\stalelog for inspection
+```
+
+Against 1.1.3 that test fails with exactly the production symptom
+(`finished startup after 1s`); against 1.1.4 all 10 checks pass. Adoption is deliberately
+unchanged (`logOffset = 0`): for a process that was already running there is no launch boundary,
+and reading what is on disk is how the supervisor learns it is alive.
 
 ## 13. Several realms on one machine (one supervisor per realm)
 

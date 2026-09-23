@@ -47,7 +47,7 @@
 // ---------------------------------------------------------------------------------------------
 //  constants
 // ---------------------------------------------------------------------------------------------
-static const wchar_t* SUPERVISOR_VERSION = L"1.1.3";
+static const wchar_t* SUPERVISOR_VERSION = L"1.1.4";
 
 enum class Level { Info, Ok, Warn, Error, Stall, Debug };
 
@@ -702,6 +702,10 @@ struct ServiceRuntime
     bool logWarned = false;
     bool logMtimeValid = false;
     std::wstring carry;
+    // The pre-existing end of the log, captured when a NEW process is launched: the offset is only
+    // trusted while those bytes are still in the file (see CaptureLogStart / ScanLogFile).
+    unsigned long long logSkipOffset = 0;
+    std::string logSkipFingerprint;
 
     // health
     bool startupReady = false;
@@ -983,6 +987,57 @@ struct LogScan
     unsigned long long size = 0;
 };
 
+// A newly launched server must only be judged by the lines IT writes. Capture where the log ends
+// right after CreateProcess, together with a fingerprint (the last bytes before that offset) that
+// proves the offset still means something later on:
+//   * appender appends  -> the fingerprint still matches, so the log is read from the captured end
+//     and a stale "World Initialized In" / "Update time diff:" line from an EARLIER run can no
+//     longer satisfy the startup rule or fake a heartbeat. (Production 2026-09-23: a worldserver
+//     that needed 19s reported "finished startup after 1s" because the supervisor read the whole
+//     old Server.log from offset 0, which also skipped the startup timeout/stall guards.)
+//   * appender truncates (mode "w", the AzerothCore default) -> the fingerprint no longer matches
+//     (or the file got shorter than the captured offset) and ScanLogFile starts from 0, so the
+//     real startup lines are still seen.
+// Adoption deliberately keeps logOffset = 0: for a process that was already running there is no
+// "since when" boundary, and reading what is on disk is how the supervisor learns it is alive.
+static void CaptureLogStart(ServiceRuntime& s)
+{
+    s.logOffset = 0;
+    s.lastLogSize = 0;
+    s.logSkipOffset = 0;
+    s.logSkipFingerprint.clear();
+
+    HANDLE h = CreateFileW(s.cfg.LogFile.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return;                                 // no log yet: read everything the server writes
+
+    LARGE_INTEGER size{};
+    if (GetFileSizeEx(h, &size) && size.QuadPart > 0)
+    {
+        unsigned long long sz = (unsigned long long)size.QuadPart;
+        s.logOffset = sz;
+        s.lastLogSize = sz;
+
+        const size_t want = 32;
+        if (sz >= want)
+        {
+            LARGE_INTEGER off{};
+            off.QuadPart = (LONGLONG)(sz - want);
+            std::string tail;
+            tail.resize(want);
+            DWORD read = 0;
+            if (SetFilePointerEx(h, off, NULL, FILE_BEGIN) &&
+                ReadFile(h, &tail[0], (DWORD)want, &read, NULL) && read == want)
+            {
+                s.logSkipOffset = sz - want;
+                s.logSkipFingerprint = tail;
+            }
+        }
+    }
+    CloseHandle(h);
+}
+
 static LogScan ScanLogFile(ServiceRuntime& s)
 {
     LogScan r;
@@ -1002,6 +1057,34 @@ static LogScan ScanLogFile(ServiceRuntime& s)
     FILETIME mtime{};
     BY_HANDLE_FILE_INFORMATION fi{};
     if (GetFileInformationByHandle(h, &fi)) mtime = fi.ftLastWriteTime;
+
+    // Once only, verify the offset captured at launch: a size comparison alone cannot tell
+    // "appended" from "truncated and already regrown past the old size by the first poll" - the
+    // fingerprint can, and it decides whether the pre-existing content is still there.
+    if (!s.logSkipFingerprint.empty())
+    {
+        bool same = false;
+        if (r.size >= s.logSkipOffset + s.logSkipFingerprint.size())
+        {
+            LARGE_INTEGER off{};
+            off.QuadPart = (LONGLONG)s.logSkipOffset;
+            std::string tail;
+            tail.resize(s.logSkipFingerprint.size());
+            DWORD read = 0;
+            if (SetFilePointerEx(h, off, NULL, FILE_BEGIN) &&
+                ReadFile(h, &tail[0], (DWORD)tail.size(), &read, NULL) &&
+                read == tail.size() && tail == s.logSkipFingerprint)
+                same = true;
+        }
+        if (!same)
+        {
+            // rewritten (or gone): the captured offset points into unrelated bytes
+            s.logOffset = 0;
+            s.lastLogSize = 0;
+            s.carry.clear();
+        }
+        s.logSkipFingerprint.clear();
+    }
 
     if (s.logMtimeValid && (mtime.dwLowDateTime != s.lastLogWrite.dwLowDateTime ||
                             mtime.dwHighDateTime != s.lastLogWrite.dwHighDateTime))
@@ -1751,8 +1834,7 @@ static void StartService(ServiceRuntime& s, int index)
     s.stopPending = false;
     s.launchTick = Tick();
     s.nextCheckTick = Tick() + 1000;             // first health check after a second
-    s.logOffset = 0;
-    s.lastLogSize = 0;
+    CaptureLogStart(s);                          // judge only what THIS process writes
     s.lastLogChangeTick = 0;
     s.logMtimeValid = false;
     s.carry.clear();
@@ -1791,8 +1873,12 @@ static bool AdoptService(ServiceRuntime& s, DWORD pid)
     s.state = ServiceRuntime::State::Running;     // it is already running; no startup phase
     s.launchTick = Tick();
     s.nextCheckTick = Tick() + 1000;
+    // Adoption keeps the old behaviour on purpose: there is no launch boundary for a process that
+    // was already running, so read the log from the start and take what is in it as the state.
     s.logOffset = 0;
     s.lastLogSize = 0;
+    s.logSkipOffset = 0;
+    s.logSkipFingerprint.clear();
     s.logMtimeValid = false;
     s.carry.clear();
     s.startupReady = true;
