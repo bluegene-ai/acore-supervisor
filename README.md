@@ -299,6 +299,67 @@ missing for 181s" and killed. The production log proves the cadence: the heartbe
 enforces `max(HeartbeatTimeoutSeconds, interval + 120s)` (see section 5), warns loudly when the
 configured timeout had to be raised, and reports the cadence in the status JSON and in `--once`.
 
-## 12. License
+## 13. Several realms on one machine (one supervisor per realm)
+
+One `acore_supervisor.exe` supervises **exactly one** worldserver + one authserver: the service
+sections are fixed (`[worldserver]`, `[authserver]` - any other section name is ignored), because
+each service needs its own working directory, log, probe port and restart policy. A machine running
+several realms therefore runs **one supervisor process per realm** - which is also the better shape:
+every realm keeps its own visible GM console, its own job object (no cross-realm kills), its own
+restart policy and its own failure domain.
+
+```
+D:\AzerothCore\release\
+    supervisor\        first instance    acore_supervisor.exe + supervisor.ini + logs\
+    supervisor-b\      second instance   (same exe, its own ini/logs)
+    realm-a\  realm-b\ the realm deployments (own exe / Data / configs)
+    auth\              the shared authserver - supervised by exactly ONE instance
+```
+
+What must differ per instance, and why:
+
+| Key | Why |
+|---|---|
+| `InstanceName` | single-instance mutex `Global\AcoreSupervisor_<InstanceName>`; a second process with the same name logs `another supervisor instance is already running` and exits |
+| `GuardLog` / `StatusFile` / `ControlFile` | otherwise the instances overwrite each other's state and steal each other's commands (one folder per instance keeps them separate automatically) |
+| `WorkDir` / `Exe` / `ServerConf` | each realm's own worldserver |
+| the shared `authserver` | enable it in **one** instance only (`Enabled = false` in the others) - two supervisors would adopt and stop the same process |
+| `ProbePort` | only when the realm runs its own authserver |
+| console window | start each instance separately so each realm gets its own GM console; never run two supervisors inside one console (`Console = shared` attaches every server to the same console, whose input is shared) |
+
+**The rule that matters most**: on one machine a given server executable may be supervised by
+**exactly one** instance. Process identity is the full exe path (`FindProcessesByExe`), so two
+supervisors pointing at the same `worldserver.exe` path would treat the other realm's process as
+"already running" - one adopts it (and later stops the wrong server), the other refuses to start.
+Give every realm its own exe path (a per-realm release tree, as above) and the problem disappears.
+
+Example `supervisor-b\supervisor.ini` (only the differences from the first instance):
+
+```ini
+[general]
+InstanceName = AcoreRealmB
+GuardLog     = logs\supervisor.log
+StatusFile   = logs\supervisor_status.json
+ControlFile  = logs\supervisor_control.txt
+
+[worldserver]
+Enabled    = true
+WorkDir    = ..\realm-b
+ServerConf = configs\worldserver.conf
+Console    = shared
+
+[authserver]
+Enabled = false          ; the shared authserver belongs to the other instance
+```
+
+Autostart: one Task Scheduler task per instance (trigger "At log on", "Run only when user is logged
+on"), or one shortcut per instance in `shell:startup`. `start_supervisor.bat` always uses the
+`supervisor.ini` next to itself, so either give each instance its own folder (as above) or launch the
+shared exe directly with `acore_supervisor.exe --config <instance>\supervisor.ini`.
+
+AGMP panel: list the instances in `config/supervisor.php` (`'instances' => [...]`), which adds an
+instance switcher to `/supervisor` and routes every call with `?instance=<id>`; see the panel README.
+
+## 14. License
 
 GPL-2.0 (see `LICENSE`) - the same license as AzerothCore and the Acore GM Panel.
