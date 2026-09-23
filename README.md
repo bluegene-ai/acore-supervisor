@@ -83,11 +83,15 @@ The auth probe answers three different ways, and they mean very different things
 |---|---|---|
 | `connect failed` | nothing accepted a TCP connection | is authserver running? is `ProbePort` the `RealmServerPort` of *this* deployment? |
 | `no response to AUTH_LOGON_CHALLENGE` | connected, sent the challenge, no answer within `ProbeTimeoutMs` | the peer swallowed the packet or is hung |
-| `short/empty auth response` | connected, sent the challenge, the peer **closed** (or answered fewer than 2 bytes) | who owns that port, and is it really an AzerothCore authserver? |
+| `auth closed the connection without answering` | connected, sent the challenge, the peer **closed without any reply** (FIN or reset) | the authserver rejected the **packet**: check the `size` field is a *little endian* uint16 equal to `30 + account length`. A healthy AzerothCore authserver never closes silently - this was the 1.1.3 bug, see below. |
+| `short auth response (N byte)` | the peer answered, but with fewer than 2 bytes | who owns that port, and is it really an AzerothCore authserver? |
 
 A well formed probe always gets an answer from AzerothCore: for the random non-existent account it
 replies `00 00 04` (`AUTH_LOGON_CHALLENGE`, `0x00`, `WOW_FAIL_UNKNOWN_ACCOUNT`) - deliberately
 invisible in `Auth.log` at the default `Logger.root=4`, because that line is `LOG_DEBUG`.
+`sAuthLogonChallenge_C` is `#pragma pack(1)` and the server reinterprets the raw receive buffer, so
+every field is native x86: `size` is a **little endian** `uint16` and `build` a little endian
+`uint16`, while `size` must equal `30 + len(account)` (`AuthSession.cpp:245-254, 289`).
 
 `tests\probe-auth.ps1` performs the same handshake by hand, prints the raw answer bytes and the
 process that owns the port, so a failing probe can be pinned down in one run:
@@ -298,6 +302,51 @@ missing for 181s" and killed. The production log proves the cadence: the heartbe
 1.1.2 reads `RecordUpdateTimeDiffInterval` / `MinRecordUpdateTimeDiff` from the server config and
 enforces `max(HeartbeatTimeoutSeconds, interval + 120s)` (see section 5), warns loudly when the
 configured timeout had to be raised, and reports the cadence in the status JSON and in `--once`.
+
+### Also in 1.1.3: the auth probe that killed a healthy authserver (the `size` field)
+
+Enabling the `[authserver]` guard restarted the authserver every ~30s, forever, with
+
+```
+[authserver] probe failed 3/3: short/empty auth response
+[authserver] probe failed 3 times in a row (short/empty auth response) - pid 12636
+[authserver] probe failed 3 times in a row (short/empty auth response) - restarting in 20s (restart #2, consecutive failures 2)
+```
+
+while `Auth.log` showed a completely normal startup and shutdown and the auth server answered real
+clients. The health signal was fine - the **probe packet was not**.
+
+`BuildProbeChallenge()` wrote the `sAuthLogonChallenge_C::size` field **big endian**:
+
+```cpp
+p.push_back((char)((size >> 8) & 0xFF));   // "big endian" - wrong
+p.push_back((char)(size & 0xFF));
+```
+
+`AuthSession::ReadHandler()` reinterprets the raw receive buffer and reads `challenge->size` as a
+native `uint16`, so a 43 byte challenge became `0x2B00` = 11008 on the server, `4 + 11008` blew past
+`MAX_ACCEPTED_CHALLENGE_SIZE` (51) and the socket was closed **without any reply**
+(`AuthSession.cpp:245-254`). The probe can only see "connected, then the peer closed", which it
+reported as `short/empty auth response` - a message that sent the reader hunting for a foreign
+process on port 3724 instead of at its own packet.
+
+Three things made this survive a full test suite and a dedicated diagnostic script:
+
+* the field is written **little endian** now (`size = 30 + account length`, `AuthSession.cpp:289`);
+* `tests\fake_acore.cs` parsed `size` big endian too, so the fixture agreed with the broken probe -
+  it now parses native/little endian, as the real server does, and answers the real 3 byte
+  `00 00 04` instead of a 2 byte shape;
+* `tests\probe-auth.ps1` (the byte level diagnostic) built the same big endian packet, so it
+  reproduced the supervisor's own bug and blamed the deployment. It is fixed and kept in sync.
+
+The probe also distinguishes the failure modes better now: a silent close is reported as
+`auth closed the connection without answering` (it means the server rejected the *packet*), a short
+answer as `short auth response (N byte)`, and the fail code is read from the third byte
+(`00 00 04` -> `fail code 0x04`) instead of the always-`0x00` second byte.
+
+Verified on this deployment against the real `authserver.exe` of rev `2c4fe4c32f0b+` (build 12340):
+the old packet gets `recv() == 0` - the peer closes with no reply - and the fixed packet gets
+`00 00 04`. `tests\run_scenario.ps1` (all scenarios) and `--once` pass afterwards.
 
 ## 13. Several realms on one machine (one supervisor per realm)
 

@@ -23,7 +23,9 @@
                   0x09 version invalid, ...)
     00 ...        a full challenge was returned: the account EXISTS, pick another name
     0 bytes       the peer closed the connection without answering - the supervisor reports
-                  this as "short/empty auth response"
+                  this as "auth closed the connection without answering"; a healthy AC
+                  authserver only does that when the CHALLENGE PACKET is malformed, so check
+                  the size field below before suspecting the deployment
     (timeout)     nothing came back within the timeout - the supervisor reports this as
                   "no response to AUTH_LOGON_CHALLENGE"
 ==========================================================================================
@@ -44,16 +46,22 @@ if ([string]::IsNullOrWhiteSpace($Account)) {
 
 # ---- the exact packet the supervisor sends ------------------------------------------------
 # struct sAuthLogonChallenge_C (AzerothCore, #pragma pack(1), 35 bytes):
-#   cmd(1) error(1) size(2, big endian) gamename[4] version1..3(3) build(2, LE)
+#   cmd(1) error(1) size(2, LITTLE endian) gamename[4] version1..3(3) build(2, LE)
 #   platform[4] os[4] country[4] timezone_bias(4) ip(4) I_len(1) I[*]
 # size = 30 + account length   (server: size - (35 - 4 - 1) == I_len)
+#
+# size is a native uint16 that AuthSession::ReadHandler reads straight out of the receive
+# buffer, so it MUST be little endian. This script used to write it big endian, which made the
+# server decode 11008 instead of 43, trip the MAX_ACCEPTED_CHALLENGE_SIZE check and close the
+# socket without a reply - i.e. the diagnostic reproduced the supervisor's own bug and blamed
+# the deployment for it. Keep this in sync with BuildProbeChallenge() in acore_supervisor.cpp.
 function New-Challenge([string]$account) {
     $size = 30 + $account.Length
     $bytes = New-Object System.Collections.Generic.List[byte]
     $bytes.Add(0x00)                                  # AUTH_LOGON_CHALLENGE
     $bytes.Add(0x08)                                  # error (unused by the server)
-    $bytes.Add([byte](($size -shr 8) -band 0xFF))     # size, big endian
-    $bytes.Add([byte]($size -band 0xFF))
+    $bytes.Add([byte]($size -band 0xFF))              # size, little endian
+    $bytes.Add([byte](($size -shr 8) -band 0xFF))
     $bytes.AddRange([Text.Encoding]::ASCII.GetBytes("WoW`0"))
     $bytes.AddRange([byte[]](3, 3, 5))                # 3.3.5
     $bytes.AddRange([byte[]]((12340 -band 0xFF), ((12340 -shr 8) -band 0xFF)))
@@ -138,11 +146,13 @@ if ($read -le 0) {
         Write-Host "RESULT     : no answer within ${TimeoutMs}ms (socket still open) - supervisor says 'no response to AUTH_LOGON_CHALLENGE'" -ForegroundColor Red
         Write-Host "             => either the peer swallowed the packet, or the service behind the port hangs." -ForegroundColor Yellow
     } else {
-        Write-Host ("RESULT     : peer closed without answering ({0}) - supervisor says 'short/empty auth response'" -f $(if ($reset) { 'connection reset' } else { '0 bytes' })) -ForegroundColor Red
-        Write-Host "             => this is the production symptom: TCP accepts, nothing answers the AC handshake." -ForegroundColor Yellow
-        Write-Host "             => check the 'listener' line above: is that PID really <authserver.exe> of THIS" -ForegroundColor Yellow
-        Write-Host "                deployment, and is it an AzerothCore build whose sAuthLogonChallenge_C layout" -ForegroundColor Yellow
-        Write-Host "                matches (32/64 bit and pack(1) aside, some forks add fields)?" -ForegroundColor Yellow
+        Write-Host ("RESULT     : peer closed without answering ({0}) - supervisor says 'auth closed the connection without answering'" -f $(if ($reset) { 'connection reset' } else { '0 bytes' })) -ForegroundColor Red
+        Write-Host "             => an AzerothCore authserver answers EVERY syntactically valid" -ForegroundColor Yellow
+        Write-Host "                AUTH_LOGON_CHALLENGE, so a silent close means it rejected the PACKET:" -ForegroundColor Yellow
+        Write-Host "                size field endianness/'size == 30 + I_len' (AuthSession.cpp:245,289)," -ForegroundColor Yellow
+        Write-Host "                or a stale build whose sAuthLogonChallenge_C layout differs." -ForegroundColor Yellow
+        Write-Host "             => check the 'listener' line above is really <authserver.exe> of THIS" -ForegroundColor Yellow
+        Write-Host "                deployment; an IP ban raced by the probe answers instead of closing." -ForegroundColor Yellow
     }
     $client.Close()
     exit 3
@@ -153,9 +163,9 @@ Write-Host "received   : $read bytes: $hex" -ForegroundColor Green
 
 if ($read -ge 2 -and $buffer[0] -eq 0x00) {
     # AzerothCore answers: [cmd=AUTH_LOGON_CHALLENGE][0x00][code] - the code is the THIRD byte
-    # (the supervisor reads the second, which is always 0x00, so its detail text says
-    #  "error code 0x00" for a healthy answer - only the detail text, the verdict is right).
-    # A 2 byte answer is what this repository's fake server sends ([cmd][code]).
+    # (the supervisor reads the third byte too since 1.1.3; older builds printed the second,
+    #  which is always 0x00, as "error code 0x00" - the verdict was right, the text was not).
+    # A 2 byte answer only comes from a fake/third-party server.
     $code = if ($read -ge 3) { $buffer[2] } else { $buffer[1] }
     $names = @{
         0x00 = 'SUCCESS - full challenge returned, this account EXISTS (fail: the probe made a real account name)'

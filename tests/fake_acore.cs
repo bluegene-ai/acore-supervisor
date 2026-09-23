@@ -250,7 +250,12 @@ internal static class FakeAcore
                         if (n <= 0) return;
                         got += n;
                     }
-                    int size = (header[2] << 8) | header[3];
+                    // sAuthLogonChallenge_C::size is a native uint16 read out of the buffer by
+                    // AuthSession::ReadHandler, so on the wire it is LITTLE endian. Parsing it big
+                    // endian (as this fake used to) makes the fake accept a packet the real
+                    // authserver silently rejects - which is exactly how a broken probe passed
+                    // the whole test suite while failing against production.
+                    int size = header[2] | (header[3] << 8);
                     byte[] rest = new byte[size];
                     int have = 0;
                     while (have < size)
@@ -264,8 +269,10 @@ internal static class FakeAcore
                         Thread.Sleep(30000);     // accept but never answer = wedged handler
                         return;
                     }
-                    // AUTH_LOGON_CHALLENGE + WOW_FAIL_UNKNOWN_ACCOUNT (silent for the real server too)
-                    byte[] resp = new byte[] { 0x00, 0x04 };
+                    // AUTH_LOGON_CHALLENGE + 0x00 + WOW_FAIL_UNKNOWN_ACCOUNT, byte for byte what
+                    // the real authserver answers for an account it cannot find (AuthSession.cpp
+                    // LogonChallengeCallback), so the fake cannot mask a bad probe packet again.
+                    byte[] resp = new byte[] { 0x00, 0x00, 0x04 };
                     stream.Write(resp, 0, resp.Length);
                     stream.Flush();
                     Ledger("ANSWERED pid=" + Process.GetCurrentProcess().Id);

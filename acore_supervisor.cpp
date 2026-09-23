@@ -47,7 +47,7 @@
 // ---------------------------------------------------------------------------------------------
 //  constants
 // ---------------------------------------------------------------------------------------------
-static const wchar_t* SUPERVISOR_VERSION = L"1.1.2";
+static const wchar_t* SUPERVISOR_VERSION = L"1.1.3";
 
 enum class Level { Info, Ok, Warn, Error, Stall, Debug };
 
@@ -1070,14 +1070,29 @@ static bool EnsureWinsock()
 // AUTH_LOGON_CHALLENGE for build 12340 with a random NON-EXISTENT account: the server answers
 // AUTH_LOGON_CHALLENGE + WOW_FAIL_UNKNOWN_ACCOUNT, which proves acceptor + handler + login DB
 // are alive, and writes nothing to Auth.log (AuthSession.cpp:322-330).
+//
+// Wire format of sAuthLogonChallenge_C (AzerothCore AuthSession.cpp, #pragma pack(1)):
+//   cmd(1) error(1) size(2) gamename[4] version1..3(3) build(2) platform[4] os[4] country[4]
+//   timezone_bias(4) ip(4) I_len(1) I[I_len]
+//
+// Two details the server enforces, and that this packet has to get exactly right:
+//   * `size` is a NATIVE uint16: ReadHandler() reinterprets the receive buffer and reads
+//     challenge->size straight out of it (AuthSession.cpp:245-254), i.e. little endian on x86.
+//     A big endian size makes the server decode 0x2B00 instead of 0x002B for a 43 byte
+//     challenge, so `4 + size` blows past MAX_ACCEPTED_CHALLENGE_SIZE (51) and the socket is
+//     closed with NO reply at all - which surfaces as "auth closed the connection without
+//     answering" (formerly "short/empty auth response") on a perfectly healthy authserver.
+//   * size must satisfy `size - (sizeof(sAuthLogonChallenge_C) - 4 - 1) == I_len`
+//     (AuthSession.cpp:289), i.e. size = 30 + account length; version1..3 and build are the
+//     per byte / little endian fields the client sends for 3.3.5a (build 12340).
 static std::string BuildProbeChallenge(const std::string& account)
 {
     std::string p;
     p.push_back((char)0x00);            // cmd AUTH_LOGON_CHALLENGE
     p.push_back((char)0x08);            // error (unused by server)
     unsigned short size = (unsigned short)(30 + account.size());
-    p.push_back((char)((size >> 8) & 0xFF));   // big endian
-    p.push_back((char)(size & 0xFF));
+    p.push_back((char)(size & 0xFF));          // size, little endian (native uint16)
+    p.push_back((char)((size >> 8) & 0xFF));
     p += "WoW";
     p.push_back('\0');
     p.push_back((char)3);
@@ -1177,16 +1192,26 @@ static bool ProbeTcpOnly(const std::wstring& host, int port, int timeoutMs, std:
     unsigned char buf[64];
     int got = recv(sock, (char*)buf, sizeof(buf), 0);
     closesocket(sock);
+    if (got <= 0)
+    {
+        // 0 = orderly FIN, -1 = reset: the authserver hung up without a reply, which it only
+        // does when it rejects the challenge packet itself (malformed size / I_len) or an IP ban
+        // raced the connection. A healthy authserver always answers (see BuildProbeChallenge).
+        detail = L"auth closed the connection without answering";
+        return false;
+    }
     if (got < 2)
     {
-        detail = L"short/empty auth response";
+        detail = Format(L"short auth response (%d byte)", got);
         return false;
     }
     unsigned char cmd = buf[0];
-    unsigned char err = buf[1];
+    // AzerothCore answers [cmd=AUTH_LOGON_CHALLENGE][0x00][fail code], so the code is the THIRD
+    // byte; a 2 byte answer only comes from a fake/other implementation, so fall back to buf[1].
+    unsigned char err = (got >= 3) ? buf[2] : buf[1];
     if (cmd == 0x00)          // AUTH_LOGON_CHALLENGE
     {
-        detail = Format(L"auth responded (error code 0x%02X)", err);
+        detail = Format(L"auth responded (fail code 0x%02X)", err);
         return true;
     }
     detail = Format(L"unexpected auth response 0x%02X", cmd);
