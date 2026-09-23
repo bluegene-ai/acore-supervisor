@@ -47,7 +47,7 @@
 // ---------------------------------------------------------------------------------------------
 //  constants
 // ---------------------------------------------------------------------------------------------
-static const wchar_t* SUPERVISOR_VERSION = L"1.1.1";
+static const wchar_t* SUPERVISOR_VERSION = L"1.1.2";
 
 enum class Level { Info, Ok, Warn, Error, Stall, Debug };
 
@@ -378,6 +378,17 @@ struct ServiceConfig
     std::wstring HeartbeatPattern = L"Update time diff: ";
     std::wstring StartupReadyPattern = L"World Initialized In";
     int HeartbeatTimeoutSeconds = 180;
+    // Cadence the SERVER configures for the heartbeat line (RecordUpdateTimeDiffInterval /
+    // MinRecordUpdateTimeDiff in worldserver.conf) and the timeout actually enforced. The effective
+    // value is raised above the interval, because a timeout below it MUST fire on a healthy server.
+    bool HeartbeatCadenceKnown = false;      // server config was parsed
+    int HeartbeatIntervalSec = 0;            // RecordUpdateTimeDiffInterval (ms -> s)
+    int HeartbeatMinRecordMs = 0;            // MinRecordUpdateTimeDiff (ms)
+    int HeartbeatTimeoutEffectiveSec = 180;
+    // "auto" (default): never use a timeout shorter than the server's own heartbeat interval,
+    // because that is guaranteed to fire on a healthy server. "strict": use the configured value as
+    // it is (only warn) - for tests that deliberately want sub-interval detection.
+    std::wstring HeartbeatTimeoutMode = L"auto";
     int LogStallSeconds = 180;
     int StartupTimeoutSeconds = 900;
     int StartupStallSeconds = 300;
@@ -482,9 +493,47 @@ static bool ResolveAutoLogFile(const std::wstring& serverConf, const std::wstrin
     return false;
 }
 
-static bool LoadConfig(const std::wstring& iniPath, GeneralConfig& gen, std::vector<ServiceConfig>& services,
-                       std::wstring& error)
+// Read the heartbeat cadence the SERVER configures. AzerothCore's WorldUpdateTime::RecordUpdateTime
+// writes the line only when a world tick exceeded MinRecordUpdateTimeDiff AND at least
+// RecordUpdateTimeDiffInterval has passed since the previous line - so the line can legitimately be
+// absent for the whole interval. Production 2026-09-23 had interval 300000 / min 100 while the
+// supervisor used a 180 s timeout: a HEALTHY worldserver was "stalled" every ~3 minutes.
+static bool ReadHeartbeatCadence(const std::wstring& serverConf, int& intervalSec, int& minRecordMs, std::wstring& why)
 {
+    intervalSec = 300;                       // AzerothCore default: 300000 ms
+    minRecordMs = 100;                       // AzerothCore default: 100 ms
+    IniMap ini;
+    if (!LoadIni(serverConf, ini))
+    {
+        why = L"server config not readable: " + serverConf;
+        return false;
+    }
+    const std::wstring keyInterval = ToLower(L"RecordUpdateTimeDiffInterval");
+    const std::wstring keyMin = ToLower(L"MinRecordUpdateTimeDiff");
+    bool seen = false;
+    for (auto& sec : ini)
+    {
+        const KeyValueMap& kv = sec.second;
+        auto itInterval = kv.find(keyInterval);
+        if (itInterval != kv.end())
+        {
+            intervalSec = ToInt(itInterval->second, intervalSec * 1000) / 1000;
+            seen = true;
+        }
+        auto itMin = kv.find(keyMin);
+        if (itMin != kv.end())
+        {
+            minRecordMs = ToInt(itMin->second, minRecordMs);
+            seen = true;
+        }
+    }
+    why = Format(L"%s (RecordUpdateTimeDiffInterval %ds, MinRecordUpdateTimeDiff %dms)", serverConf.c_str(),
+                 intervalSec, minRecordMs);
+    return seen;
+}
+
+static bool LoadConfig(const std::wstring& iniPath, GeneralConfig& gen, std::vector<ServiceConfig>& services,
+                       std::wstring& error){
     IniMap ini;
     if (!LoadIni(iniPath, ini))
     {
@@ -552,6 +601,20 @@ static bool LoadConfig(const std::wstring& iniPath, GeneralConfig& gen, std::vec
         if (k.find(L"startupreadypattern") == k.end()) s.StartupReadyPattern = (s.Role == L"auth") ? L"" : L"World Initialized In";
 
         s.HeartbeatTimeoutSeconds = ToInt(get(L"heartbeattimeoutseconds"), s.HeartbeatTimeoutSeconds);
+        s.HeartbeatTimeoutMode = ToLower(get(L"heartbeattimeoutmode").empty() ? L"auto" : get(L"heartbeattimeoutmode"));
+        // Enforce a timeout that can actually be met: the heartbeat line may legitimately be missing
+        // for the server's configured RecordUpdateTimeDiffInterval.
+        s.HeartbeatTimeoutEffectiveSec = s.HeartbeatTimeoutSeconds;
+        if (!s.HeartbeatPattern.empty())
+        {
+            std::wstring cadenceWhy;
+            s.HeartbeatCadenceKnown = ReadHeartbeatCadence(s.ConfFile, s.HeartbeatIntervalSec, s.HeartbeatMinRecordMs, cadenceWhy);
+            if (s.HeartbeatTimeoutMode != L"strict" && s.HeartbeatCadenceKnown && s.HeartbeatIntervalSec > 0)
+            {
+                int needed = s.HeartbeatIntervalSec + 120;      // one full interval + slack
+                if (needed > s.HeartbeatTimeoutEffectiveSec) s.HeartbeatTimeoutEffectiveSec = needed;
+            }
+        }
         s.LogStallSeconds = ToInt(get(L"logstallseconds"), s.LogStallSeconds);
         s.StartupTimeoutSeconds = ToInt(get(L"startuptimeoutseconds"), s.StartupTimeoutSeconds);
         s.StartupStallSeconds = ToInt(get(L"startupstallseconds"), s.StartupStallSeconds);
@@ -1282,7 +1345,10 @@ static void WriteStatusFile(const GeneralConfig& gen, const std::vector<ServiceR
         json += Format(L"      \"heartbeatSeen\": %s,\n", s.heartbeatSeen ? L"true" : L"false");
         json += Format(L"      \"heartbeatCadenceSec\": %d,\n", s.observedHeartbeatSec);
         json += Format(L"      \"heartbeatAgeSec\": %lld,\n", hbAge);
-        json += Format(L"      \"heartbeatTimeoutSec\": %d,\n", s.cfg.HeartbeatTimeoutSeconds);
+        json += Format(L"      \"heartbeatTimeoutSec\": %d,\n", s.cfg.HeartbeatTimeoutEffectiveSec);
+        json += Format(L"      \"heartbeatTimeoutConfiguredSec\": %d,\n", s.cfg.HeartbeatTimeoutSeconds);
+        json += Format(L"      \"heartbeatIntervalSec\": %d,\n", s.cfg.HeartbeatIntervalSec);
+        json += Format(L"      \"heartbeatMinRecordMs\": %d,\n", s.cfg.HeartbeatMinRecordMs);
         json += Format(L"      \"cpuTotalMs\": %llu,\n", s.cpuTotalLast / 10000ull);
         json += Format(L"      \"workingSetMB\": %.1f,\n", s.workingSetMB);
         json += Format(L"      \"probeOk\": %s,\n", s.probeOk ? L"true" : L"false");
@@ -1555,12 +1621,15 @@ static void HealthCheck(ServiceRuntime& s, ULONGLONG now)
         if (s.heartbeatSeen)
         {
             ULONGLONG hbAge = AgeSeconds(now, s.lastHeartbeatTick);
-            if (hbAge > (ULONGLONG)s.cfg.HeartbeatTimeoutSeconds)
+            if (hbAge > (ULONGLONG)s.cfg.HeartbeatTimeoutEffectiveSec)
             {
                 // The observed cadence is part of the message on purpose: it tells a cadence problem
                 // (e.g. MinRecordUpdateTimeDiff left at its default 100) from a real frozen world loop.
                 std::wstring detail = Format(L"world-loop heartbeat missing for %llus (limit %ds", hbAge,
-                                             s.cfg.HeartbeatTimeoutSeconds);
+                                             s.cfg.HeartbeatTimeoutEffectiveSec);
+                if (s.cfg.HeartbeatTimeoutEffectiveSec != s.cfg.HeartbeatTimeoutSeconds)
+                    detail += Format(L" = max(HeartbeatTimeoutSeconds %d, RecordUpdateTimeDiffInterval %ds + 120)",
+                                     s.cfg.HeartbeatTimeoutSeconds, s.cfg.HeartbeatIntervalSec);
                 if (s.observedHeartbeatSec > 0)
                     detail += Format(L", last cadence %ds", s.observedHeartbeatSec);
                 else
@@ -1591,7 +1660,7 @@ static void HealthCheck(ServiceRuntime& s, ULONGLONG now)
     {
         if (s.logSeen && logStaleSec > (ULONGLONG)s.cfg.LogStallSeconds)
         {
-            bool cpuAlsoStalled = cpuStaleSec > (ULONGLONG)s.cfg.HeartbeatTimeoutSeconds;
+            bool cpuAlsoStalled = cpuStaleSec > (ULONGLONG)s.cfg.HeartbeatTimeoutEffectiveSec;
             if (!s.cfg.CpuCrossCheck || cpuAlsoStalled)
             {
                 KillAndSchedule(s, Format(L"no log activity for %llus and CPU stalled for %llus",
@@ -2025,6 +2094,15 @@ static int RunOnce()
                                 s.cfg.LogFile.c_str(), EqualsIgnoreCase(s.cfg.LogFileSetting, L"auto") ? L"auto" : L"configured"));
         Log(Level::Info, Format(L"[%s] heartbeat pattern: %s", s.cfg.Name.c_str(),
                                 s.cfg.HeartbeatPattern.empty() ? L"<none>" : s.cfg.HeartbeatPattern.c_str()));
+        if (!s.cfg.HeartbeatPattern.empty())
+        {
+            Log(s.cfg.HeartbeatCadenceKnown ? Level::Info : Level::Warn,
+                Format(L"[%s] heartbeat cadence from the server config: every %ds (RecordUpdateTimeDiffInterval), "
+                       L"only when a tick exceeds %dms (MinRecordUpdateTimeDiff) -> the enforced timeout is %ds%s",
+                       s.cfg.Name.c_str(), s.cfg.HeartbeatIntervalSec, s.cfg.HeartbeatMinRecordMs,
+                       s.cfg.HeartbeatTimeoutEffectiveSec,
+                       s.cfg.HeartbeatCadenceKnown ? L"" : L" (server config not readable - assuming the AzerothCore defaults)"));
+        }
         Log(Level::Info, Format(L"[%s] probe: %s port %d", s.cfg.Name.c_str(), s.cfg.ProbeMode.c_str(), s.cfg.ProbePort));
         Log(Level::Info, Format(L"[%s] status file: %s", s.cfg.Name.c_str(), g_gen.StatusFile.c_str()));
         Log(Level::Info, Format(L"[%s] control file: %s", s.cfg.Name.c_str(), g_gen.ControlFile.c_str()));
@@ -2127,7 +2205,31 @@ int wmain(int argc, wchar_t** argv)
         Log(Level::Info, Format(L"    workdir   : %s", s.cfg.WorkDir.c_str()));
         Log(Level::Info, Format(L"    log       : %s", s.cfg.LogFile.c_str()));
         Log(Level::Info, Format(L"    heartbeat : %s (timeout %ds)", s.cfg.HeartbeatPattern.empty()
-                                ? L"<none>" : s.cfg.HeartbeatPattern.c_str(), s.cfg.HeartbeatTimeoutSeconds));
+                                ? L"<none>" : s.cfg.HeartbeatPattern.c_str(), s.cfg.HeartbeatTimeoutEffectiveSec));
+        if (!s.cfg.HeartbeatPattern.empty() && s.cfg.HeartbeatCadenceKnown)
+        {
+            Log(Level::Info, Format(L"    cadence   : server writes it every %ds (RecordUpdateTimeDiffInterval),"
+                                    L" min tick %dms (MinRecordUpdateTimeDiff)", s.cfg.HeartbeatIntervalSec,
+                                    s.cfg.HeartbeatMinRecordMs));
+            if (s.cfg.HeartbeatTimeoutEffectiveSec != s.cfg.HeartbeatTimeoutSeconds)
+                Log(Level::Warn, Format(L"[%s] HeartbeatTimeoutSeconds = %ds is shorter than the server's own "
+                                        L"heartbeat interval (%ds): the rule would fire on a HEALTHY server. "
+                                        L"Using %ds for this run. Set MinRecordUpdateTimeDiff = 0 and "
+                                        L"RecordUpdateTimeDiffInterval = 60000 in worldserver.conf for a tight check.",
+                                        s.cfg.Name.c_str(), s.cfg.HeartbeatTimeoutSeconds, s.cfg.HeartbeatIntervalSec,
+                                        s.cfg.HeartbeatTimeoutEffectiveSec));
+            else if (s.cfg.HeartbeatTimeoutSeconds <= s.cfg.HeartbeatIntervalSec)
+                Log(Level::Warn, Format(L"[%s] HeartbeatTimeoutSeconds = %ds is not longer than the server's own "
+                                        L"heartbeat interval (%ds) and HeartbeatTimeoutMode = strict keeps it: the rule "
+                                        L"would fire on a HEALTHY server. Set MinRecordUpdateTimeDiff = 0 and "
+                                        L"RecordUpdateTimeDiffInterval = 60000, or remove HeartbeatTimeoutMode = strict.",
+                                        s.cfg.Name.c_str(), s.cfg.HeartbeatTimeoutSeconds, s.cfg.HeartbeatIntervalSec));
+            if (s.cfg.HeartbeatMinRecordMs > 0)
+                Log(Level::Warn, Format(L"[%s] MinRecordUpdateTimeDiff = %dms: the heartbeat line is only written "
+                                        L"when a world tick was slower than that, so on a quiet server it can be "
+                                        L"absent for far longer than the interval. Set it to 0.",
+                                        s.cfg.Name.c_str(), s.cfg.HeartbeatMinRecordMs));
+        }
         Log(Level::Info, Format(L"    probe     : %s", s.cfg.ProbePort > 0
                                 ? Format(L"%s %s:%d (timeout %dms)", s.cfg.ProbeMode.c_str(),
                                          s.cfg.ProbeHost.c_str(), s.cfg.ProbePort, s.cfg.ProbeTimeoutMs).c_str()

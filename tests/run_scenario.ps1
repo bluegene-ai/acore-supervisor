@@ -154,6 +154,10 @@ $authEnabledLine = "Enabled = $authEnabled"
     'HeartbeatPattern = Update time diff:',
     'StartupReadyPattern = World Initialized In',
     'HeartbeatTimeoutSeconds = 9',
+    # the fake worldserver.conf declares RecordUpdateTimeDiffInterval = 60000, but these scenarios
+    # deliberately want a 9 s rule to prove detection inside a few seconds - so opt out of the
+    # "never shorter than the server's own cadence" auto adjustment (1.1.2)
+    'HeartbeatTimeoutMode = strict',
     'StartupTimeoutSeconds = 40',
     'StartupStallSeconds = 30',
     'StartupGraceSeconds = 20',
@@ -378,7 +382,7 @@ switch ($Scenario) {
     'healthy' {
         Want ($joined -match '\[worldserver\] pid \d+ finished startup') 'worldserver startup recognised'
         Want ($joined -match '\[authserver\] pid \d+ finished startup') 'authserver startup recognised'
-        Want ($joined -notmatch 'STALL') 'no hang was reported'
+        Want ($joined -notmatch '\[STALL\]') 'no hang was reported'
         Want ($wStarts -eq 1 -and $aStarts -eq 1) 'both services started exactly once'
         Want ($status -match '"heartbeatSeen": true') 'world-loop heartbeat was observed'
         Want ($status -match '"probeOk": true') 'auth probe succeeded'

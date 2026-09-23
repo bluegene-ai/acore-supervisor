@@ -77,7 +77,6 @@ is read out of the server's own conf, so it cannot point at the wrong file), whe
 heartbeat line is present in the log, and the result of the auth probe. Nothing is started.
 
 ### When the auth probe fails
-
 The auth probe answers three different ways, and they mean very different things:
 
 | `--once` / log text | what happened | what to check |
@@ -153,6 +152,24 @@ The line is written through the `time.update` logger (`Logger.time.update=<level
 `worldserver.conf`; level 4 = info is enough). If it is not configured, the supervisor logs
 `heartbeat line ... never appeared` once and falls back to log activity + CPU.
 
+**Since 1.1.2 the supervisor reads both options out of the server config** (`ServerConf`, which it
+already parses for `LogFile = auto`) and enforces
+
+```
+effective timeout = max(HeartbeatTimeoutSeconds, RecordUpdateTimeDiffInterval + 120s)
+```
+
+unless `HeartbeatTimeoutMode = strict` is set (which keeps `HeartbeatTimeoutSeconds` exactly as
+written and only warns). That rule exists so a timeout shorter than the interval - a guaranteed
+false stall, and the exact shape of the 2026-09-23 incident where production had
+`RecordUpdateTimeDiffInterval = 300000` with a 180 s timeout - can no longer kill a healthy server.
+It logs both values at startup, warns when it had to raise the timeout (`a HEALTHY server would be
+reported as stalled`), warns when `MinRecordUpdateTimeDiff > 0`, and publishes `heartbeatTimeoutSec`
+(enforced), `heartbeatTimeoutConfiguredSec`, `heartbeatIntervalSec` and `heartbeatMinRecordMs` in
+the status JSON. `--once` prints the same summary, including "server config not readable - assuming
+the AzerothCore defaults" when `ServerConf` is missing (in that case the configured timeout is used
+unchanged).
+
 ## 6. Settings worth knowing (`supervisor.ini`)
 
 | key | meaning |
@@ -160,6 +177,7 @@ The line is written through the `time.update` logger (`Logger.time.update=<level
 | `LogFile` | `auto` = take `LogsDir` **and** the role's own appender (`Appender.Server` / `Appender.Auth`) from the server conf; or an explicit path |
 | `HeartbeatPattern` | substring that identifies a world-loop tick; empty = no heartbeat rule (authserver) |
 | `HeartbeatTimeoutSeconds` | no heartbeat for this long while the process lives = frozen world loop -> restart |
+| `HeartbeatTimeoutMode` | `auto` (default) never uses a timeout shorter than the server's `RecordUpdateTimeDiffInterval`; `strict` uses `HeartbeatTimeoutSeconds` as written (only warns) - for tests or when you knowingly accept sub-interval detection |
 | `StartupReadyPattern` / `StartupTimeoutSeconds` / `StartupStallSeconds` | startup grace so a slow map load is never mistaken for a hang |
 | `StopGraceSeconds` | how long to wait for the clean `CTRL_BREAK` shutdown before killing |
 | `RestartDelaySeconds` / `MaxBackoffSeconds` / `StableRunSeconds` | restart policy |
@@ -239,7 +257,6 @@ exactly as they were. In the deployment this tool came from, the previous PowerS
 at the same time, two supervisors would fight over the same servers.
 
 ## 11. Adopted processes and the one-instance guarantee (1.1.1)
-
 `AdoptExisting = true` lets the supervisor take over a server that is already running, but a
 hand-started process is not a child: it is not in the supervisor's job object, it does not share
 the supervisor's console, and it was opened by someone else. Three consequences, all of them
@@ -268,6 +285,19 @@ Regression test: `pwsh -File tests\run_adopt_test.ps1` reproduces the incident (
 that freezes) and asserts that the adopted process is really killed, that a replacement is started
 only afterwards, that two instances never coexist, that the replacement dies with the supervisor,
 and that a foreign instance is adopted instead of duplicated (16 checks).
+
+### Also in 1.1.2: the stall that killed the healthy server
+
+The same production incident had a second, independent cause: the supervisor's
+`HeartbeatTimeoutSeconds = 180` was **shorter than the heartbeat cadence the server configures**
+(`RecordUpdateTimeDiffInterval = 300000`), so a perfectly healthy worldserver - 12-13 players
+online, a log line every minute, world ticks of 100-120 ms - was reported as "world-loop heartbeat
+missing for 181s" and killed. The production log proves the cadence: the heartbeat lines appear at
+09:41, 09:46, 09:51, 09:56, 10:01, 10:06, 10:11 and 10:16, exactly five minutes apart.
+
+1.1.2 reads `RecordUpdateTimeDiffInterval` / `MinRecordUpdateTimeDiff` from the server config and
+enforces `max(HeartbeatTimeoutSeconds, interval + 120s)` (see section 5), warns loudly when the
+configured timeout had to be raised, and reports the cadence in the status JSON and in `--once`.
 
 ## 12. License
 
