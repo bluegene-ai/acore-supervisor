@@ -54,6 +54,7 @@ present in `Server.log` and runs the auth probe - without starting anything. The
 | authserver health | TCP connect to `RealmServerPort` (3724) + one `AUTH_LOGON_CHALLENGE` for a random **non-existent** account | the real authserver logs almost nothing, so the log is useless as a signal. The probe proves acceptor + packet handler + login DB work, and produces **no** Auth.log line, no failed-login counter and no WrongPass ban (`AuthSession.cpp:322-330`) |
 | stop order | `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` to the server's own process group (= AzerothCore's clean `SIGBREAK` shutdown that saves characters), then `TerminateJobObject` after `StopGraceSeconds` | no data loss when the server is merely slow; a hard kill only when it is really stuck |
 | restart policy | exit 0 = clean stop (not restarted), exit 2 = planned restart, anything else = failure with doubling backoff up to `MaxBackoffSeconds`; `StableRunSeconds` resets the counter | survives crash loops without hammering the DB |
+| one instance only | the start path refuses to launch a second copy of a server whose executable is already running, and a process that survived a stop is never "restarted" (the stop is retried instead) | two worldservers on one database is worse than a stalled one (see section 11) |
 | console | `SetConsoleCtrlHandler` handles Ctrl+C / Ctrl+Break / **window close** / logoff / shutdown | closing the window now stops the servers first (the PowerShell version orphaned them) |
 | GM console | `Console = shared` keeps the server writing into the supervisor window | the GM command line keeps working exactly as before |
 
@@ -132,6 +133,25 @@ MinRecordUpdateTimeDiff      = 0         ; always record, not only when a tick w
 
 (already set in this deployment; cost is ~5 log lines per minute). Without it the supervisor
 warns once and falls back to log-activity + CPU cross-check monitoring.
+
+Both lines matter for the *cadence*, which is what a timeout can be compared against. AzerothCore
+writes the line from `WorldUpdateTime::RecordUpdateTime`:
+
+```cpp
+if (_recordUpdateTimeInverval > 0ms && diff > _recordUpdateTimeMin.count())   // diff > Min...
+    if (GetMSTimeDiff(_lastRecordTime, gameTimeMs) > _recordUpdateTimeInverval)
+        LOG_INFO("time.update", "Update time diff: {}ms with {} players online", ...);
+```
+
+So with the **default `MinRecordUpdateTimeDiff = 100`** the line appears only when a world tick took
+longer than 100 ms: on a quiet or lightly loaded server that can be minutes apart, and
+`HeartbeatTimeoutSeconds = 180` then produces a false stall. Set it to `0` (and, if the server is
+very quiet, keep the timeout at 3x the configured interval), or raise `HeartbeatTimeoutSeconds`
+to cover the worst realistic tick interval.
+
+The line is written through the `time.update` logger (`Logger.time.update=<level>,<appenders>` in
+`worldserver.conf`; level 4 = info is enough). If it is not configured, the supervisor logs
+`heartbeat line ... never appeared` once and falls back to log activity + CPU.
 
 ## 6. Settings worth knowing (`supervisor.ini`)
 
@@ -218,6 +238,37 @@ exactly as they were. In the deployment this tool came from, the previous PowerS
 (`watch_dog.bat` + `worldserver_watchdog.ps1`) is still present as a fallback - never run both
 at the same time, two supervisors would fight over the same servers.
 
-## 11. License
+## 11. Adopted processes and the one-instance guarantee (1.1.1)
+
+`AdoptExisting = true` lets the supervisor take over a server that is already running, but a
+hand-started process is not a child: it is not in the supervisor's job object, it does not share
+the supervisor's console, and it was opened by someone else. Three consequences, all of them
+handled explicitly since 1.1.1:
+
+| Situation | Behaviour |
+|---|---|
+| `CTRL_BREAK` to an adopted process | fails (`Win32 error 87`) - a foreign console cannot be signalled. Logged at WARN with the reason; the process can only be killed, never shut down gracefully. |
+| Killing an adopted process | the handle is opened **with `PROCESS_TERMINATE`**. Before 1.1.1 it was not, so `TerminateProcess` failed with `ERROR_ACCESS_DENIED` **silently** and the process survived. If the right cannot be obtained at all, the supervisor logs an ERROR at adoption and treats the process as unstoppable. |
+| The process survives a stop | the supervisor **refuses to start a second instance**: it keeps the handle, retries the stop every `max(RestartDelaySeconds, 15)` seconds and logs `pid X is STILL RUNNING after the stop (...) - refusing to start a second instance`. Before 1.1.1 it restarted anyway, which is how two worldservers ended up running side by side (production incident 2026-09-23). |
+
+Independently of that, `StartService` checks for any other process running the same executable
+before launching one, and adopts it (with `AdoptExisting`) or refuses with an ERROR. Two
+worldservers, or two authservers, on one machine and one database are never a valid state.
+
+Recommendation: do not hand-start the servers on a machine that has the supervisor. Stop them once
+and let `start_supervisor.bat` launch them - only then are they in the job object (killed with the
+supervisor, no orphans), in the shared GM console (`Console = shared`) and stoppable gracefully.
+
+Also fixed in 1.1.1: the "cpu last advanced …s ago" diagnostic used an unsigned subtraction between
+a tick captured at the start of a health check and a CPU sample taken later in the same check; it
+wrapped to ~1.8e16 seconds and, worse, made the CPU cross-check in the log-activity fallback always
+report "CPU also stalled", so it never protected a quiet-but-busy server. Ages are now clamped.
+
+Regression test: `pwsh -File tests\run_adopt_test.ps1` reproduces the incident (hand-started fake
+that freezes) and asserts that the adopted process is really killed, that a replacement is started
+only afterwards, that two instances never coexist, that the replacement dies with the supervisor,
+and that a foreign instance is adopted instead of duplicated (16 checks).
+
+## 12. License
 
 GPL-2.0 (see `LICENSE`) - the same license as AzerothCore and the Acore GM Panel.

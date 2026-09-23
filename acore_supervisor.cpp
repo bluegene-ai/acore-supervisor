@@ -47,7 +47,7 @@
 // ---------------------------------------------------------------------------------------------
 //  constants
 // ---------------------------------------------------------------------------------------------
-static const wchar_t* SUPERVISOR_VERSION = L"1.1.0";
+static const wchar_t* SUPERVISOR_VERSION = L"1.1.1";
 
 enum class Level { Info, Ok, Warn, Error, Stall, Debug };
 
@@ -57,6 +57,18 @@ enum class Level { Info, Ok, Warn, Error, Stall, Debug };
 static ULONGLONG Tick()
 {
     return GetTickCount64();
+}
+
+// Seconds elapsed since `when`, never wrapped and never negative.
+// A sample taken later in the same tick (SampleCpuAndMemory calls Tick() after the caller
+// captured `now`) makes `when` slightly NEWER than `now`; an unsigned subtraction would then
+// wrap to ~2^64 - which showed up in production as
+// "cpu last advanced 18446744073709551s ago" and, worse, made the CPU cross-check in the
+// log-activity fallback always report "CPU also stalled" (so it never protected a busy server).
+static ULONGLONG AgeSeconds(ULONGLONG now, ULONGLONG when)
+{
+    if (when == 0 || when >= now) return 0;
+    return (now - when) / 1000;
 }
 
 static std::wstring Format(const wchar_t* fmt, ...)
@@ -609,6 +621,9 @@ struct ServiceRuntime
     HANDLE hPort = NULL;              // job completion port
     DWORD pid = 0;
     bool adopted = false;
+    bool canTerminate = false;        // false: PROCESS_TERMINATE was refused at adoption time
+    bool stopPending = false;         // a stop was attempted but the process survived it
+    bool restartAfterStop = true;     // what to do once a pending stop finally succeeds
 
     State state = State::Stopped;
     ULONGLONG launchTick = 0;
@@ -629,6 +644,8 @@ struct ServiceRuntime
     bool startupReady = false;
     bool heartbeatSeen = false;
     ULONGLONG lastHeartbeatTick = 0;
+    int observedHeartbeatSec = 0;           // gap between the last two heartbeat lines
+    bool cadenceWarned = false;             // cadence > timeout: the rule would fire on a healthy server
     bool heartbeatUnavailable = false;      // pattern configured but never seen -> fall back
     bool stallWarned = false;
     ULONGLONG cpuTotalLast = 0;
@@ -858,15 +875,34 @@ static std::wstring StopServiceProcess(ServiceRuntime& s, bool graceful)
         }
         else
         {
-            Log(Level::Debug, Format(L"[%s] GenerateConsoleCtrlEvent failed (%lu); forcing",
-                                     s.cfg.Name.c_str(), GetLastError()));
+            DWORD err = GetLastError();
+            Log(Level::Warn, Format(L"[%s] cannot send CTRL_BREAK to pid %lu (Win32 error %lu)%s",
+                                    s.cfg.Name.c_str(), s.pid, err,
+                                    s.adopted ? L" - an adopted process does not share the supervisor's console, "
+                                                L"so it can only be killed, never shut down gracefully" : L""));
         }
     }
 
     if (s.hJob)
-        TerminateJobObject(s.hJob, 1);
+    {
+        if (!TerminateJobObject(s.hJob, 1))
+            Log(Level::Error, Format(L"[%s] TerminateJobObject failed (Win32 error %lu) - pid %lu may survive",
+                                     s.cfg.Name.c_str(), GetLastError(), s.pid));
+    }
     else if (s.hProcess)
-        TerminateProcess(s.hProcess, 1);
+    {
+        if (!TerminateProcess(s.hProcess, 1))
+        {
+            DWORD err = GetLastError();
+            Log(Level::Error, Format(L"[%s] TerminateProcess(pid %lu) failed (Win32 error %lu)", s.cfg.Name.c_str(),
+                                     s.pid, err));
+            if (!s.canTerminate)
+                Log(Level::Error, Format(L"[%s] the handle was opened without PROCESS_TERMINATE (adopted "
+                                         L"hand-started process) - it can only be stopped manually",
+                                         s.cfg.Name.c_str()));
+            return L"failed";
+        }
+    }
 
     DWORD w = WaitForSingleObject(s.hProcess, 15000);
     return (w == WAIT_OBJECT_0) ? L"forced" : L"failed";
@@ -1227,9 +1263,9 @@ static void WriteStatusFile(const GeneralConfig& gen, const std::vector<ServiceR
         if (s.logMtimeValid)
         {
             ULONGLONG lastChange = s.lastLogChangeTick ? s.lastLogChangeTick : s.launchTick;
-            logAge = (long long)((now - lastChange) / 1000);
+            logAge = (long long)AgeSeconds(now, lastChange);
         }
-        long long hbAge = s.heartbeatSeen ? (long long)((now - s.lastHeartbeatTick) / 1000) : -1;
+        long long hbAge = s.heartbeatSeen ? (long long)AgeSeconds(now, s.lastHeartbeatTick) : -1;
         json += L"    {\n";
         json += L"      \"name\": \"" + JsonEscape(s.cfg.Name) + L"\",\n";
         json += L"      \"role\": \"" + JsonEscape(s.cfg.Role) + L"\",\n";
@@ -1244,6 +1280,7 @@ static void WriteStatusFile(const GeneralConfig& gen, const std::vector<ServiceR
         json += L"      \"logFile\": \"" + JsonEscape(s.cfg.LogFile) + L"\",\n";
         json += Format(L"      \"logStaleSec\": %lld,\n", logAge);
         json += Format(L"      \"heartbeatSeen\": %s,\n", s.heartbeatSeen ? L"true" : L"false");
+        json += Format(L"      \"heartbeatCadenceSec\": %d,\n", s.observedHeartbeatSec);
         json += Format(L"      \"heartbeatAgeSec\": %lld,\n", hbAge);
         json += Format(L"      \"heartbeatTimeoutSec\": %d,\n", s.cfg.HeartbeatTimeoutSeconds);
         json += Format(L"      \"cpuTotalMs\": %llu,\n", s.cpuTotalLast / 10000ull);
@@ -1319,6 +1356,27 @@ static void KillAndSchedule(ServiceRuntime& s, const std::wstring& reason, bool 
     std::wstring how = StopServiceProcess(s, true);
     s.lastStopHow = how;
     Log(Level::Warn, Format(L"[%s] stop result: %s", s.cfg.Name.c_str(), how.c_str()));
+
+    // A process that SURVIVED the stop must not be "restarted": that is how two worldservers ended
+    // up running side by side in production (2026-09-23), fighting over the same ports and database.
+    // Keep the handle (so we can retry the stop) and come back instead of starting a second instance.
+    if (IsAlive(s))
+    {
+        int retry = s.cfg.RestartDelaySeconds > 15 ? s.cfg.RestartDelaySeconds : 15;
+        if (failure) s.consecutiveFailures++;
+        s.stopPending = true;
+        s.lastEvent = L"stop-failed";
+        Log(Level::Error, Format(L"[%s] pid %lu is STILL RUNNING after the stop (%s) - refusing to start a "
+                                 L"second instance; retrying the stop in %ds%s",
+                                 s.cfg.Name.c_str(), (unsigned long)s.pid, how.c_str(), retry,
+                                 s.canTerminate
+                                     ? L""
+                                     : L" (it was adopted without PROCESS_TERMINATE, so only a manual stop can work)"));
+        s.state = ServiceRuntime::State::WaitingRestart;
+        s.nextActionTick = Tick() + (ULONGLONG)retry * 1000ull;
+        return;
+    }
+
     CloseProcessHandles(s);
 
     if (failure) s.consecutiveFailures++;
@@ -1392,6 +1450,22 @@ static void HealthCheck(ServiceRuntime& s, ULONGLONG now)
         if (scan.changed || s.lastLogChangeTick == 0) s.lastLogChangeTick = now;
         if (scan.heartbeat)
         {
+            if (s.lastHeartbeatTick != 0)
+            {
+                s.observedHeartbeatSec = (int)AgeSeconds(now, s.lastHeartbeatTick);
+                // Only a warning: the cadence itself is fine, but it leaves almost no margin, so a
+                // single missed beat will look like a stall (production 2026-09-23: cadence 62s).
+                if (!s.cadenceWarned && s.observedHeartbeatSec > 0 &&
+                    (ULONGLONG)s.observedHeartbeatSec * 2 > (ULONGLONG)s.cfg.HeartbeatTimeoutSeconds)
+                {
+                    s.cadenceWarned = true;
+                    Log(Level::Warn, Format(L"[%s] the heartbeat line appears every ~%ds while HeartbeatTimeoutSeconds is %d: "
+                                            L"one missed beat already looks like a stall. Set MinRecordUpdateTimeDiff = 0 (and "
+                                            L"RecordUpdateTimeDiffInterval = 60000) in %s, or raise HeartbeatTimeoutSeconds.",
+                                            s.cfg.Name.c_str(), s.observedHeartbeatSec, s.cfg.HeartbeatTimeoutSeconds,
+                                            s.cfg.ConfFile.c_str()));
+                }
+            }
             s.heartbeatSeen = true;
             s.lastHeartbeatTick = now;
             s.stallWarned = false;
@@ -1408,8 +1482,8 @@ static void HealthCheck(ServiceRuntime& s, ULONGLONG now)
     DrainJobPort(s);
 
     const ULONGLONG lifeSec = (now - s.launchTick) / 1000;
-    const ULONGLONG logStaleSec = s.lastLogChangeTick ? (now - s.lastLogChangeTick) / 1000 : lifeSec;
-    const ULONGLONG cpuStaleSec = s.lastCpuChangeTick ? (now - s.lastCpuChangeTick) / 1000 : lifeSec;
+    const ULONGLONG logStaleSec = s.lastLogChangeTick ? AgeSeconds(now, s.lastLogChangeTick) : lifeSec;
+    const ULONGLONG cpuStaleSec = s.lastCpuChangeTick ? AgeSeconds(now, s.lastCpuChangeTick) : lifeSec;
 
     // ---------------- probe (runs in both phases: for authserver it is the main signal) -----
     if (s.cfg.ProbePort > 0)
@@ -1480,11 +1554,18 @@ static void HealthCheck(ServiceRuntime& s, ULONGLONG now)
     {
         if (s.heartbeatSeen)
         {
-            ULONGLONG hbAge = (now - s.lastHeartbeatTick) / 1000;
+            ULONGLONG hbAge = AgeSeconds(now, s.lastHeartbeatTick);
             if (hbAge > (ULONGLONG)s.cfg.HeartbeatTimeoutSeconds)
             {
-                std::wstring detail = Format(L"world-loop heartbeat missing for %llus (limit %ds)",
-                                             hbAge, s.cfg.HeartbeatTimeoutSeconds);
+                // The observed cadence is part of the message on purpose: it tells a cadence problem
+                // (e.g. MinRecordUpdateTimeDiff left at its default 100) from a real frozen world loop.
+                std::wstring detail = Format(L"world-loop heartbeat missing for %llus (limit %ds", hbAge,
+                                             s.cfg.HeartbeatTimeoutSeconds);
+                if (s.observedHeartbeatSec > 0)
+                    detail += Format(L", last cadence %ds", s.observedHeartbeatSec);
+                else
+                    detail += L", no cadence observed yet - check RecordUpdateTimeDiffInterval/MinRecordUpdateTimeDiff";
+                detail += L")";
                 if (s.cfg.CpuCrossCheck)
                     detail += Format(L" [cpu last advanced %llus ago]", cpuStaleSec);
                 KillAndSchedule(s, detail, true);
@@ -1537,8 +1618,31 @@ static void HealthCheck(ServiceRuntime& s, ULONGLONG now)
     }
 }
 
+static bool AdoptService(ServiceRuntime& s, DWORD pid);   // defined below (used by StartService)
+
 static void StartService(ServiceRuntime& s, int index)
 {
+    // Safety net: never launch a second copy of a server that is already running. The stop path
+    // refuses to restart a surviving process, but a process could also appear from somewhere else
+    // (started by hand, a leftover from a previous supervisor, a scheduled task). Whatever the
+    // reason, one worldserver + one authserver is the only correct state.
+    for (DWORD other : FindProcessesByExe(s.cfg.Exe))
+    {
+        if (other == s.pid || other == GetCurrentProcessId()) continue;
+        if (s.cfg.AdoptExisting && AdoptService(s, other))
+        {
+            Log(Level::Warn, Format(L"[%s] pid %lu is already running with this exe - adopting it instead of "
+                                    L"starting a second instance", s.cfg.Name.c_str(), (unsigned long)other));
+            return;
+        }
+        s.consecutiveFailures++;
+        s.lastEvent = L"start-refused";
+        Log(Level::Error, Format(L"[%s] pid %lu already runs %s and AdoptExisting is off - refusing to start a "
+                                 L"second instance", s.cfg.Name.c_str(), (unsigned long)other, s.cfg.Exe.c_str()));
+        ScheduleRestart(s, GetRestartDelay(s), L"another instance is already running");
+        return;
+    }
+
     std::wstring error;
     if (!StartServiceProcess(s, index, error))
     {
@@ -1550,6 +1654,7 @@ static void StartService(ServiceRuntime& s, int index)
     }
 
     s.state = ServiceRuntime::State::Starting;
+    s.stopPending = false;
     s.launchTick = Tick();
     s.nextCheckTick = Tick() + 1000;             // first health check after a second
     s.logOffset = 0;
@@ -1560,6 +1665,8 @@ static void StartService(ServiceRuntime& s, int index)
     s.startupReady = false;
     s.heartbeatSeen = false;
     s.heartbeatUnavailable = false;
+    s.observedHeartbeatSec = 0;
+    s.cadenceWarned = false;
     s.stallWarned = false;
     s.lastHeartbeatTick = 0;
     s.lastCpuChangeTick = Tick();
@@ -1574,11 +1681,17 @@ static void StartService(ServiceRuntime& s, int index)
 
 static bool AdoptService(ServiceRuntime& s, DWORD pid)
 {
-    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    // PROCESS_TERMINATE is what makes a later stop possible. Opening the handle without it (as an
+    // earlier version did) leaves TerminateProcess() failing with ERROR_ACCESS_DENIED, and a restart
+    // then produced a SECOND instance next to the surviving one (production incident 2026-09-23).
+    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, pid);
+    bool canTerminate = (h != NULL);
+    if (!h) h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!h) return false;
     s.hProcess = h;
     s.pid = pid;
     s.adopted = true;
+    s.canTerminate = canTerminate;
     s.hJob = NULL;                                // we cannot re-parent a foreign process
     s.hPort = NULL;
     s.state = ServiceRuntime::State::Running;     // it is already running; no startup phase
@@ -1590,9 +1703,19 @@ static bool AdoptService(ServiceRuntime& s, DWORD pid)
     s.carry.clear();
     s.startupReady = true;
     s.lastCpuChangeTick = Tick();
+    s.observedHeartbeatSec = 0;
+    s.cadenceWarned = false;
     s.lastEvent = L"adopted";
     Log(Level::Warn, Format(L"[%s] adopting the already running pid %lu (process tree kill unavailable "
                             L"for adopted processes)", s.cfg.Name.c_str(), (unsigned long)pid));
+    if (!canTerminate)
+    {
+        Log(Level::Error, Format(L"[%s] pid %lu does not grant PROCESS_TERMINATE: it can be monitored but "
+                                 L"NOT stopped, so it will never be restarted automatically. Stop it by hand and "
+                                 L"let the supervisor start it (a hand-started server is also not in the "
+                                 L"supervisor's job object, so closing the supervisor leaves it running).",
+                                 s.cfg.Name.c_str(), (unsigned long)pid));
+    }
     return true;
 }
 
@@ -1691,6 +1814,20 @@ static std::wstring ExecuteControlCommand(const std::wstring& id, const std::wst
             s.lastEvent = L"stopped-by-panel";
             std::wstring how = StopServiceProcess(s, true);
             s.lastStopHow = how;
+            if (IsAlive(s))
+            {
+                // keep tracking it: an operator that believes the server is stopped is worse than
+                // one that is told the stop failed
+                int retry = s.cfg.RestartDelaySeconds > 15 ? s.cfg.RestartDelaySeconds : 15;
+                s.stopPending = true;
+                s.restartAfterStop = false;         // the operator asked for "stopped", not "restarted"
+                s.state = ServiceRuntime::State::WaitingRestart;
+                s.nextActionTick = Tick() + (ULONGLONG)retry * 1000ull;
+                Log(Level::Error, Format(L"[%s] stop failed (%s) - pid %lu is still running, retrying in %ds",
+                                         s.cfg.Name.c_str(), how.c_str(), (unsigned long)s.pid, retry));
+                results.push_back(s.cfg.Name + L": stop FAILED (" + how + L"), still running as pid " + std::to_wstring(s.pid));
+                continue;
+            }
             CloseProcessHandles(s);
             s.state = ServiceRuntime::State::Stopped;
             results.push_back(s.cfg.Name + L": stopped (" + how + L")");
@@ -1714,10 +1851,24 @@ static std::wstring ExecuteControlCommand(const std::wstring& id, const std::wst
             s.killedByUs = true;
             std::wstring how = StopServiceProcess(s, true);
             s.lastStopHow = how;
-            CloseProcessHandles(s);
             s.consecutiveFailures = 0;              // an operator-requested restart is not a failure
             s.serviceStopped = false;
             s.stoppedByUser = false;
+            if (IsAlive(s))
+            {
+                // the old process survived: retry the stop in the background and only then start the
+                // new one (the start path refuses to run two copies anyway)
+                int retry = s.cfg.RestartDelaySeconds > 15 ? s.cfg.RestartDelaySeconds : 15;
+                s.stopPending = true;
+                s.restartAfterStop = true;
+                s.state = ServiceRuntime::State::WaitingRestart;
+                s.nextActionTick = Tick() + (ULONGLONG)retry * 1000ull;
+                Log(Level::Error, Format(L"[%s] restart: stop failed (%s) - pid %lu is still running, retrying in %ds",
+                                         s.cfg.Name.c_str(), how.c_str(), (unsigned long)s.pid, retry));
+                results.push_back(s.cfg.Name + L": restart deferred, stop FAILED (" + how + L"), pid " + std::to_wstring(s.pid) + L" still running");
+                continue;
+            }
+            CloseProcessHandles(s);
             StartService(s, idx);
             results.push_back(s.cfg.Name + L": restarted (" + how + L")");
             continue;
@@ -1733,6 +1884,14 @@ static std::wstring ExecuteControlCommand(const std::wstring& id, const std::wst
             s.lastEvent = L"stopped-by-panel";
             std::wstring how = StopServiceProcess(s, true);
             s.lastStopHow = how;
+            if (IsAlive(s))
+            {
+                Log(Level::Error, Format(L"[%s] shutdown: pid %lu survived the stop (%s) - it will keep running "
+                                         L"after the supervisor exits", s.cfg.Name.c_str(), (unsigned long)s.pid, how.c_str()));
+                results.push_back(s.cfg.Name + L": stop FAILED (" + how + L"), pid " + std::to_wstring(s.pid) + L" still running");
+                g_exitAfterCommand = true;
+                continue;
+            }
             CloseProcessHandles(s);
             s.state = ServiceRuntime::State::Stopped;
             results.push_back(s.cfg.Name + L": stopped (" + how + L")");
@@ -1872,6 +2031,14 @@ static int RunOnce()
 
         auto pids = FindProcessesByExe(s.cfg.Exe);
         Log(Level::Info, Format(L"[%s] running processes with this exe: %d", s.cfg.Name.c_str(), (int)pids.size()));
+        if (!pids.empty())
+        {
+            Log(Level::Warn, Format(L"[%s] note: %s is already running by hand (pid %lu). With AdoptExisting the "
+                                    L"supervisor will adopt it, but a hand-started process shares no console with the "
+                                    L"supervisor, so it can only be killed - never shut down gracefully - and it is not "
+                                    L"in the supervisor's job object. Stop it and let the supervisor start it.",
+                                    s.cfg.Name.c_str(), s.cfg.Exe.c_str(), (unsigned long)pids[0]));
+        }
 
         ServiceRuntime tmp;
         tmp.cfg = s.cfg;
@@ -2020,6 +2187,14 @@ int wmain(int argc, wchar_t** argv)
                 if (s.state == ServiceRuntime::State::Stopped || !s.hProcess) continue;
                 std::wstring how = StopServiceProcess(s, true);
                 Log(Level::Info, Format(L"[%s] stop result: %s", s.cfg.Name.c_str(), how.c_str()));
+                if (IsAlive(s))
+                {
+                    Log(Level::Error, Format(L"[%s] pid %lu survived the stop (%s) and will keep running after "
+                                             L"this supervisor exits%s", s.cfg.Name.c_str(), (unsigned long)s.pid,
+                                             how.c_str(),
+                                             s.canTerminate ? L"" : L" (adopted without PROCESS_TERMINATE - stop it manually)"));
+                    continue;                       // keep the handle so the log stays truthful
+                }
                 CloseProcessHandles(s);
                 s.state = ServiceRuntime::State::Stopped;
             }
@@ -2044,7 +2219,36 @@ int wmain(int argc, wchar_t** argv)
                     break;
                 case ServiceRuntime::State::WaitingRestart:
                     if (now >= s.nextActionTick)
+                    {
+                        if (s.stopPending)
+                        {
+                            // the previous instance survived an earlier stop: retry that first, never
+                            // start a second copy next to it
+                            std::wstring how = StopServiceProcess(s, true);
+                            s.lastStopHow = how;
+                            Log(Level::Warn, Format(L"[%s] retried stop of pid %lu: %s",
+                                                    s.cfg.Name.c_str(), (unsigned long)s.pid, how.c_str()));
+                            if (IsAlive(s))
+                            {
+                                int retry = s.cfg.RestartDelaySeconds > 15 ? s.cfg.RestartDelaySeconds : 15;
+                                s.nextActionTick = now + (ULONGLONG)retry * 1000ull;
+                                break;
+                            }
+                            s.stopPending = false;
+                            CloseProcessHandles(s);
+                            if (!s.restartAfterStop)
+                            {
+                                // the pending stop came from a "stop" request: honour it and stay down
+                                s.state = ServiceRuntime::State::Stopped;
+                                s.serviceStopped = true;
+                                s.stoppedByUser = true;
+                                Log(Level::Info, Format(L"[%s] the pending stop finally succeeded - staying stopped "
+                                                        L"(send a start command to run it again)", s.cfg.Name.c_str()));
+                                break;
+                            }
+                        }
                         StartService(s, (int)(&s - &g_services[0]));
+                    }
                     break;
                 default:
                 {
@@ -2091,11 +2295,16 @@ int wmain(int argc, wchar_t** argv)
                 ULONGLONG uptime = s.launchTick ? (now - s.launchTick) / 1000 : 0;
                 std::wstring extra;
                 if (s.heartbeatSeen)
-                    extra = Format(L"hb %llus ago", (now - s.lastHeartbeatTick) / 1000);
+                {
+                    std::wstring cadence = s.observedHeartbeatSec > 0
+                                               ? Format(L" (cadence %ds)", s.observedHeartbeatSec)
+                                               : L"";
+                    extra = Format(L"hb %llus ago%s", AgeSeconds(now, s.lastHeartbeatTick), cadence.c_str());
+                }
                 else if (s.cfg.ProbePort > 0)
                     extra = Format(L"probe %s", s.probeOk ? L"ok" : L"FAIL");
                 else
-                    extra = Format(L"log %llds ago", (long long)(s.lastLogChangeTick ? (now - s.lastLogChangeTick) / 1000 : -1));
+                    extra = Format(L"log %llus ago", AgeSeconds(now, s.lastLogChangeTick ? s.lastLogChangeTick : s.launchTick));
                 Log(Level::Info, Format(L"[%s] %s pid %lu up %lluh%02llum, %s, cpu %llums, ws %.0fMB, restarts %d",
                                         s.cfg.Name.c_str(), StateName(s.state).c_str(), (unsigned long)s.pid,
                                         uptime / 3600, (uptime / 60) % 60, extra.c_str(),
