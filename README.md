@@ -75,6 +75,33 @@ It prints the resolved executable paths, the log file it will watch (with `LogFi
 is read out of the server's own conf, so it cannot point at the wrong file), whether the
 heartbeat line is present in the log, and the result of the auth probe. Nothing is started.
 
+### When the auth probe fails
+
+The auth probe answers three different ways, and they mean very different things:
+
+| `--once` / log text | what happened | what to check |
+|---|---|---|
+| `connect failed` | nothing accepted a TCP connection | is authserver running? is `ProbePort` the `RealmServerPort` of *this* deployment? |
+| `no response to AUTH_LOGON_CHALLENGE` | connected, sent the challenge, no answer within `ProbeTimeoutMs` | the peer swallowed the packet or is hung |
+| `short/empty auth response` | connected, sent the challenge, the peer **closed** (or answered fewer than 2 bytes) | who owns that port, and is it really an AzerothCore authserver? |
+
+A well formed probe always gets an answer from AzerothCore: for the random non-existent account it
+replies `00 00 04` (`AUTH_LOGON_CHALLENGE`, `0x00`, `WOW_FAIL_UNKNOWN_ACCOUNT`) - deliberately
+invisible in `Auth.log` at the default `Logger.root=4`, because that line is `LOG_DEBUG`.
+
+`tests\probe-auth.ps1` performs the same handshake by hand, prints the raw answer bytes and the
+process that owns the port, so a failing probe can be pinned down in one run:
+
+```
+pwsh -File tests\probe-auth.ps1                        # 127.0.0.1:3724
+pwsh -File tests\probe-auth.ps1 -Port 3724 -TimeoutMs 3000
+```
+
+It distinguishes the three cases above and names the returned fail code
+(`0x04` unknown account, `0x03` banned, `0x09` version invalid, ...). Needs no admin rights on a
+normal desktop session; where port ownership cannot be queried it prints the `netstat -ano` line
+to run instead.
+
 ## 4. Run
 
 ```
