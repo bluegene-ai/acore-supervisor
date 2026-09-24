@@ -10,13 +10,32 @@ rem  Usage:  start_supervisor.bat                 start + supervise
 rem          start_supervisor.bat --once          verify config/paths/probes, then exit
 rem          start_supervisor.bat --help
 rem          start_supervisor.bat /nopause ...    do not keep the window open at the end
+rem
+rem  The window title is derived from THIS folder plus the InstanceName in supervisor.ini, so one
+rem  console per realm stays distinguishable when several supervisors run side by side:
+rem      Svr [Acore80] supervisor        Svr [acoreT] supervisor-test
+rem  Never hard-code the title: with one supervisor per realm every copy of this file would show
+rem  the same name, and Ctrl+Tab / the taskbar gives no clue which realm a window belongs to.
 rem =========================================================================================
 setlocal EnableExtensions EnableDelayedExpansion
-title Svr-80 [supervisor]
 
 set "HERE=%~dp0"
 set "EXE=%HERE%acore_supervisor.exe"
 set "INI=%HERE%supervisor.ini"
+
+rem ---- window title: <instance name from the ini> @ <this folder> ---------------------------
+rem for /f reads the ini directly (no findstr): comments starting with ';' are skipped and the
+rem delimiters strip the spaces around the '=' in "InstanceName    = Acore80"
+set "SUPDIR=%~dp0"
+for %%I in ("%SUPDIR:~0,-1%") do set "SUPDIR=%%~nxI"
+set "SUPINST="
+if exist "%INI%" for /f "usebackq tokens=1,* delims== " %%A in ("%INI%") do if /i "%%A"=="InstanceName" set "SUPINST=%%B"
+if defined SUPINST set "SUPINST=%SUPINST: =%"
+if defined SUPINST (
+    title Svr [%SUPINST%] %SUPDIR%
+) else (
+    title Svr [%SUPDIR%]
+)
 
 set "ARGS=%*"
 set "NOPAUSE="
