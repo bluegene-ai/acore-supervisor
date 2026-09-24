@@ -47,7 +47,7 @@
 // ---------------------------------------------------------------------------------------------
 //  constants
 // ---------------------------------------------------------------------------------------------
-static const wchar_t* SUPERVISOR_VERSION = L"1.1.4";
+static const wchar_t* SUPERVISOR_VERSION = L"1.1.5";
 
 enum class Level { Info, Ok, Warn, Error, Stall, Debug };
 
@@ -389,6 +389,13 @@ struct ServiceConfig
     // because that is guaranteed to fire on a healthy server. "strict": use the configured value as
     // it is (only warn) - for tests that deliberately want sub-interval detection.
     std::wstring HeartbeatTimeoutMode = L"auto";
+    // The server config PROVES the heartbeat line cannot be relied on for a tight timeout, because
+    // the core only writes it when `diff > MinRecordUpdateTimeDiff` (UpdateTime.cpp:165). With
+    // MinRecordUpdateTimeDiff > 0 a quiet server legitimately produces no line for far longer than
+    // RecordUpdateTimeDiffInterval, so the heartbeat is not a usable health rule at all: use the
+    // log-activity + CPU fallback from the start instead of waiting out a widened timeout that then
+    // kills a healthy server anyway (production 2026-09-23).
+    bool HeartbeatUnreliable = false;
     int LogStallSeconds = 180;
     int StartupTimeoutSeconds = 900;
     int StartupStallSeconds = 300;
@@ -613,6 +620,27 @@ static bool LoadConfig(const std::wstring& iniPath, GeneralConfig& gen, std::vec
             {
                 int needed = s.HeartbeatIntervalSec + 120;      // one full interval + slack
                 if (needed > s.HeartbeatTimeoutEffectiveSec) s.HeartbeatTimeoutEffectiveSec = needed;
+            }
+            // Deciding this from the config is what separates "healthy but quiet" from "frozen".
+            // Both cases look identical at runtime (heartbeat absent, CPU advancing, log written),
+            // so the config - not a runtime heuristic - has to say whether the line is even
+            // producible on time. Only services that actually HAVE a heartbeat pattern are affected;
+            // authserver has none by design and is probed over TCP instead.
+            if (!s.HeartbeatCadenceKnown)
+            {
+                // pattern configured but the server config could not be read (or declares no
+                // cadence): there is no evidence the line can be produced at the configured
+                // cadence, so the bare HeartbeatTimeoutSeconds is an unverified guess.
+                s.HeartbeatUnreliable = true;
+            }
+            else if (s.HeartbeatMinRecordMs > 0)
+            {
+                // The core gates the line on `diff > _recordUpdateTimeMin.count()`
+                // (UpdateTime.cpp:165), so MinRecordUpdateTimeDiff > 0 means a quiet server writes
+                // it far less often than RecordUpdateTimeDiffInterval - the supervisor then waits
+                // out the widened limit and restarts a HEALTHY server anyway (production
+                // 2026-09-23: min tick 100ms, heartbeat 425s old, CPU advancing 1s earlier).
+                s.HeartbeatUnreliable = true;
             }
         }
         s.LogStallSeconds = ToInt(get(L"logstallseconds"), s.LogStallSeconds);
@@ -1723,8 +1751,10 @@ static void HealthCheck(ServiceRuntime& s, ULONGLONG now)
     }
 
     // ---------------- running phase ----------------
-    // 1) world-loop heartbeat: the signal that cannot be faked by a background logger
-    if (!s.cfg.HeartbeatPattern.empty())
+    // 1) world-loop heartbeat: the signal that cannot be faked by a background logger.
+    //    Skipped for a heartbeat the server config proved unreliable: there the line is absent by
+    //    design on a quiet server, so judging on it can only produce false stalls.
+    if (!s.cfg.HeartbeatPattern.empty() && !s.cfg.HeartbeatUnreliable)
     {
         if (s.heartbeatSeen)
         {
@@ -1743,6 +1773,16 @@ static void HealthCheck(ServiceRuntime& s, ULONGLONG now)
                 else
                     detail += L", no cadence observed yet - check RecordUpdateTimeDiffInterval/MinRecordUpdateTimeDiff";
                 detail += L")";
+
+                // A timeout here is a genuine frozen world loop, and it is killed. The CPU is
+                // deliberately NOT used to veto this rule: a frozen world loop with a chatty
+                // background logger still advances the process CPU time (the logger thread keeps
+                // running), so a CPU gate would silently disable the one signal that catches exactly
+                // that case (tests\run_scenario.ps1 "chatty"). Whether this rule may be trusted at
+                // all is decided from the SERVER CONFIG instead (HeartbeatUnreliable, above): with
+                // MinRecordUpdateTimeDiff > 0 the line is absent by design on a quiet server, so the
+                // rule is skipped and log-activity + CPU monitoring is used, which is what stops the
+                // 2026-09-23 false restart.
                 if (s.cfg.CpuCrossCheck)
                     detail += Format(L" [cpu last advanced %llus ago]", cpuStaleSec);
                 KillAndSchedule(s, detail, true);
@@ -1764,7 +1804,7 @@ static void HealthCheck(ServiceRuntime& s, ULONGLONG now)
     }
 
     // 2) fallback: log activity, cross-checked against CPU progress
-    if ((s.cfg.HeartbeatPattern.empty() || s.heartbeatUnavailable) && s.cfg.ProbePort <= 0)
+    if ((s.cfg.HeartbeatPattern.empty() || s.heartbeatUnavailable || s.cfg.HeartbeatUnreliable) && s.cfg.ProbePort <= 0)
     {
         if (s.logSeen && logStaleSec > (ULONGLONG)s.cfg.LogStallSeconds)
         {
@@ -2336,11 +2376,26 @@ int wmain(int argc, wchar_t** argv)
                                         L"RecordUpdateTimeDiffInterval = 60000, or remove HeartbeatTimeoutMode = strict.",
                                         s.cfg.Name.c_str(), s.cfg.HeartbeatTimeoutSeconds, s.cfg.HeartbeatIntervalSec));
             if (s.cfg.HeartbeatMinRecordMs > 0)
-                Log(Level::Warn, Format(L"[%s] MinRecordUpdateTimeDiff = %dms: the heartbeat line is only written "
-                                        L"when a world tick was slower than that, so on a quiet server it can be "
-                                        L"absent for far longer than the interval. Set it to 0.",
-                                        s.cfg.Name.c_str(), s.cfg.HeartbeatMinRecordMs));
+                Log(Level::Error, Format(L"[%s] MinRecordUpdateTimeDiff = %dms: the heartbeat line is only written "
+                                         L"when a world tick was slower than that, so on a quiet server it can be "
+                                         L"absent for far longer than the interval - a widened timeout cannot fix "
+                                         L"that. The heartbeat is NOT used as the health rule for this run; "
+                                         L"log-activity + CPU monitoring is. Set it to 0.",
+                                         s.cfg.Name.c_str(), s.cfg.HeartbeatMinRecordMs));
         }
+        else if (!s.cfg.HeartbeatPattern.empty())
+        {
+            // Was silent before: an unreadable ServerConf left the bare HeartbeatTimeoutSeconds in
+            // force with nothing in the log to say so.
+            Log(Level::Error, Format(L"[%s] the server config %s could not be read, so the heartbeat cadence "
+                                     L"(RecordUpdateTimeDiffInterval/MinRecordUpdateTimeDiff) is UNKNOWN and the "
+                                     L"configured %ds timeout is an unverified guess. The heartbeat is used only "
+                                     L"as a hint this run; log-activity + CPU monitoring is the health rule.",
+                                     s.cfg.Name.c_str(), s.cfg.ConfFile.c_str(), s.cfg.HeartbeatTimeoutSeconds));
+        }
+        if (s.cfg.HeartbeatUnreliable && !s.cfg.HeartbeatPattern.empty())
+            Log(Level::Warn, Format(L"    health    : log activity + CPU (the heartbeat is only advisory: the "
+                                    L"server config shows it cannot be produced often enough)"));
         Log(Level::Info, Format(L"    probe     : %s", s.cfg.ProbePort > 0
                                 ? Format(L"%s %s:%d (timeout %dms)", s.cfg.ProbeMode.c_str(),
                                          s.cfg.ProbeHost.c_str(), s.cfg.ProbePort, s.cfg.ProbeTimeoutMs).c_str()

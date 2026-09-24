@@ -69,12 +69,19 @@ foreach ($d in @($worldDir, (Join-Path $worldDir 'configs'), (Join-Path $worldDi
 Copy-Item (Join-Path $base 'fake_world.exe') (Join-Path $worldDir 'worldserver.exe') -Force
 Copy-Item (Join-Path $base 'fake_auth.exe')  (Join-Path $authDir  'authserver.exe') -Force
 
-# server-side configs: the supervisor reads LogsDir + appender name from these (LogFile = auto)
+# server-side configs: the supervisor reads LogsDir + appender name from these (LogFile = auto).
+# MinRecordUpdateTimeDiff = 0 is REQUIRED for the heartbeat scenarios: the world-loop heartbeat
+# line is only written when a world tick was slower than MinRecordUpdateTimeDiff
+# (UpdateTime.cpp:165), so at the AzerothCore default of 100ms an idle worldserver legitimately
+# writes no line at all - and the supervisor now (correctly) refuses to judge health on a
+# heartbeat the server config proves cannot be produced on time. Without this line the
+# healthy/hang/chatty scenarios would be testing the log-activity fallback, not the heartbeat rule.
 [System.IO.File]::WriteAllLines((Join-Path $worldDir 'configs\worldserver.conf'), @(
     '[worldserver]',
     'LogsDir = "logs"',
     'Appender.Server=2,5,0,Server.log,w',
-    'RecordUpdateTimeDiffInterval = 60000'
+    'RecordUpdateTimeDiffInterval = 60000',
+    'MinRecordUpdateTimeDiff = 0'
 ))
 [System.IO.File]::WriteAllLines((Join-Path $authDir 'configs\authserver.conf'), @(
     '[authserver]',

@@ -137,6 +137,17 @@ MinRecordUpdateTimeDiff      = 0         ; always record, not only when a tick w
 (already set in this deployment; cost is ~5 log lines per minute). Without it the supervisor
 warns once and falls back to log-activity + CPU cross-check monitoring.
 
+**Both settings matter, and since 1.1.5 the supervisor refuses to judge health on a heartbeat the
+config cannot produce.** With `MinRecordUpdateTimeDiff` left at its default `100` an idle
+worldserver writes no line for far longer than `RecordUpdateTimeDiffInterval`, so a heartbeat
+timeout proves nothing and the rule is skipped in favour of log-activity + CPU (see section 12,
+"1.1.5"). Track the gap with this one-liner rather than guessing, and expect to see
+`MinRecordUpdateTimeDiff` reported as `0ms` in the startup summary:
+
+```powershell
+& .\acore_supervisor.exe --config supervisor.ini --once | Select-String 'cadence'
+```
+
 Both lines matter for the *cadence*, which is what a timeout can be compared against. AzerothCore
 writes the line from `WorldUpdateTime::RecordUpdateTime`:
 
@@ -394,6 +405,71 @@ Against 1.1.3 that test fails with exactly the production symptom
 (`finished startup after 1s`); against 1.1.4 all 10 checks pass. Adoption is deliberately
 unchanged (`logOffset = 0`): for a process that was already running there is no launch boundary,
 and reading what is on disk is how the supervisor learns it is alive.
+
+### 1.1.5: a heartbeat the server config cannot produce is no longer a health rule
+
+Production incident 2026-09-23 (`E:\Pure\wow`), from `supervisor.log`:
+
+```
+23:08:33  [worldserver] running pid 2680 up 0h15m, hb   0s ago, cpu 690549ms, ws 2598MB
+23:09:33  [worldserver] running pid 2680 up 0h16m, hb  93s ago, cpu 691324ms, ws 2598MB
+23:10:36  [worldserver] running pid 2680 up 0h17m, hb 153s ago, cpu 691762ms, ws 2598MB
+...                                                                      (cpu keeps rising)
+23:14:56  [STALL] world-loop heartbeat missing for 425s
+                  (limit 420s = max(HeartbeatTimeoutSeconds 180s, RecordUpdateTimeDiffInterval 300s + 120),
+                   no cadence observed yet) - pid 2680
+23:15:01  stop result: graceful
+23:15:12  started pid 4668
+```
+
+The world loop was **healthy the whole time** - the CPU advanced on every single sample - yet the
+server was restarted. The heartbeat age climbed monotonically (0 → 93 → 153 → 214 → 275 → 335 →
+395 → 425 s) while the CPU never stopped.
+
+The cause is the gate in `WorldUpdateTime::RecordUpdateTime` (`UpdateTime.cpp:165`):
+
+```cpp
+if (_recordUpdateTimeInverval > 0ms && diff > _recordUpdateTimeMin.count())
+```
+
+The line is only written when a world tick was **slower** than `MinRecordUpdateTimeDiff`. That
+deployment still had both AzerothCore defaults - `RecordUpdateTimeDiffInterval = 300000` and
+`MinRecordUpdateTimeDiff = 100` - so on an idle realm (ticks of 7-17 ms) the line was written
+rarely, then not at all. `RecordUpdateTimeDiffInterval` alone was then used to widen the timeout to
+420 s, which only delayed the false restart: a widened timeout cannot conjure a line the config
+forbids.
+
+1.1.5 reads the cadence and decides whether the heartbeat is a usable health rule **before** the
+run starts:
+
+| server config | health rule | why |
+|---|---|---|
+| `MinRecordUpdateTimeDiff = 0` and the config is readable | world-loop heartbeat (authoritative) | the line is written every `RecordUpdateTimeDiffInterval` on any live loop, so its absence is a real freeze |
+| `MinRecordUpdateTimeDiff > 0` | log activity + CPU | the line is gated on slow ticks, so absence is expected on a quiet server and proves nothing |
+| `ServerConf` unreadable | log activity + CPU | the cadence is unknown, so the configured timeout is an unverified guess |
+
+The choice is logged at startup - the ERROR and the `health : log activity + CPU` line replace the
+old behaviour, which widened the timeout and said nothing:
+
+```
+[ERROR] [worldserver] MinRecordUpdateTimeDiff = 100ms: ... The heartbeat is NOT used as the
+        health rule for this run; log-activity + CPU monitoring is. Set it to 0.
+[WARN ]     health    : log activity + CPU (the heartbeat is only advisory: the server config
+        shows it cannot be produced often enough)
+```
+
+The heartbeat rule itself is **unchanged** when it is authoritative: a timeout still restarts the
+server, and the CPU is deliberately *not* allowed to veto it. A frozen world loop with a chatty
+background logger still advances the process CPU (the logger thread keeps running), so gating the
+heartbeat rule on "CPU also stalled" would silently disable the one signal that catches that case -
+`tests\run_scenario.ps1 -Scenario chatty` exists precisely to prevent it. Two distinguishable
+configurations, not one clever override, is what separates "healthy but quiet" from "frozen".
+
+Because of that, `tests\run_scenario.ps1` now writes `MinRecordUpdateTimeDiff = 0` into the fake
+`worldserver.conf`: the heartbeat scenarios test the heartbeat rule, and without that line they
+would be exercising the fallback instead. The 2026-09-23 false restart is covered by pointing the
+fixed and unfixed binaries at a config with `MinRecordUpdateTimeDiff = 100` and draining the
+heartbeat while the CPU keeps advancing: 1.1.4 restarts the server repeatedly, 1.1.5 does not.
 
 ## 13. Several realms on one machine (one supervisor per realm)
 
