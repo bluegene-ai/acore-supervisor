@@ -253,8 +253,9 @@ powershell -File tests\run_scenario.ps1 -Scenario control -UsePhp `
 ```
 Scenarios: `once`, `healthy`, `chatty` (frozen world loop behind a chatty logger),
 `hang`, `crash`, `planned`, `clean`, `authwedged` (authserver accepts but never answers),
-`child` (job-object tree kill), `console` (Ctrl+Break), `consoleclose` (WM_CLOSE = clicking X),
-`control` (the panel contract: ping / restart / stop / start / rejected / shutdown).
+`authdisabled` (a shared authserver this supervisor does not run: commands naming it must be
+refused), `child` (job-object tree kill), `console` (Ctrl+Break), `consoleclose` (WM_CLOSE =
+clicking X), `control` (the panel contract: ping / restart / stop / start / rejected / shutdown).
 The driver resolves the supervisor binary relative to the repository
 (`..\..\release\supervisor\acore_supervisor.exe`), so pass `-SupervisorExe` when yours lives
 elsewhere. All scenarios pass.
@@ -470,6 +471,38 @@ Because of that, `tests\run_scenario.ps1` now writes `MinRecordUpdateTimeDiff = 
 would be exercising the fallback instead. The 2026-09-23 false restart is covered by pointing the
 fixed and unfixed binaries at a config with `MinRecordUpdateTimeDiff = 100` and draining the
 heartbeat while the CPU keeps advancing: 1.1.4 restarts the server repeatedly, 1.1.5 does not.
+
+### 1.1.6: a service this supervisor does not run can no longer be commanded through it
+
+With one supervisor per realm, a shared authserver is `Enabled = true` in exactly one ini and
+`Enabled = false` in the others. The control channel only filtered disabled services for a
+*broadcast* (`target=all`); naming one explicitly resolved it with `FindServiceIndex()` and ran the
+action, so `start` / `restart` reached `StartService()` and **started a second authserver** next to
+the one another supervisor owns - from one click on the wrong realm's page, or from a hand-written
+control file:
+
+```
+1.1.5:  restart/start/stop/shutdown -> ok / ok / ok / ok      auth starts 1   (the disabled
+        service really ran; the aimed shutdown also exited the whole supervisor)
+1.1.6:  restart/start/stop/shutdown -> rejected x4            auth starts 0
+        rejected: 'authserver' is disabled in this supervisor (Enabled = false)
+                  - another supervisor owns it
+```
+
+`ping` stays allowed for a disabled service: it only asks whether the control channel is alive and
+touches no service. A broadcast still acts on the services this supervisor owns, and when nothing is
+enabled at all the answer is now `rejected: this supervisor runs no enabled service (...)`, not the
+misleading "unknown target".
+
+Beyond the supervisor refusing it, the AGMP panel hides the control buttons for such a service (see
+its own release notes) - both layers exist on purpose: the panel prevents the mistake, the
+supervisor makes it impossible.
+
+Regression test: `tests\run_scenario.ps1 -Scenario authdisabled` (14 checks) starts a fake
+worldserver with `[authserver] Enabled = false`, sends restart/start/stop/shutdown/ping for the
+disabled service, then broadcasts a restart and asserts the worldservice really restarted, no
+authserver process ever appeared and the supervisor is still alive. Point it at an older binary
+(`-SupervisorExe`) and 11 of the 14 checks fail.
 
 ## 13. Several realms on one machine (one supervisor per realm)
 

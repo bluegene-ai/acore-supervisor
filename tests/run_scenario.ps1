@@ -102,6 +102,7 @@ switch ($Scenario) {
     'clean'      { $worldMode = 'clean' }
     'planned'    { $worldMode = 'planned' }
     'authwedged' { $worldMode = 'healthy'; $authMode = 'silent' }
+    'authdisabled' { $worldMode = 'healthy'; $authEnabled = 'false' }
     'child'      { $worldMode = 'chatty'; $childExe = Join-Path $base 'fake_child.exe' }
     'console'    { $worldMode = 'healthy' }
     'consoleclose' { $worldMode = 'healthy' }
@@ -110,6 +111,13 @@ switch ($Scenario) {
     default      { Write-Host "unknown scenario $Scenario"; exit 2 }
 }
 if (-not $authMode) { $authMode = 'healthy' }
+
+# Counts fake-server lifecycle events in a ledger. Defined at the top level: the per-scenario blocks
+# below use it (a function defined inside one scenario's block only exists once that block ran).
+function Count-Ledger([string]$Path, [string]$Pattern) {
+    if (-not (Test-Path $Path)) { return 0 }
+    return @(Get-Content $Path | Where-Object { $_ -match $Pattern }).Count
+}
 
 # per-service settings live in config files so the tracked process IS the fake server itself
 # (exactly like the real deployment, where the tracked process is worldserver.exe)
@@ -281,10 +289,7 @@ if ($Scenario -eq 'console' -or $Scenario -eq 'consoleclose') {
         return @($s.services | Where-Object { $_.name -eq $Name })[0]
     }
     # read the ledgers directly: the variables used by the evidence block are filled in later
-    function Count-Ledger([string]$Path, [string]$Pattern) {
-        if (-not (Test-Path $Path)) { return 0 }
-        return @(Get-Content $Path | Where-Object { $_ -match $Pattern }).Count
-    }
+    # (Count-Ledger itself is defined at the top level, it is shared with other scenarios)
 
     $controlResults = [ordered]@{}
     Write-Host '[driver] waiting for both services to finish startup'
@@ -347,6 +352,67 @@ if ($Scenario -eq 'console' -or $Scenario -eq 'consoleclose') {
         authStateStopped = if ($authStatusStopped) { $authStatusStopped.state } else { '' }
         authStoppedByUser = if ($authStatusStopped) { [bool]$authStatusStopped.stoppedByUser } else { $false }
         rejectedNotExecuted = -not $controlStillPresent
+    }
+} elseif ($Scenario -eq 'authdisabled') {
+    # ---- a service this supervisor does not run must be REFUSED, never silently started ----------
+    # One supervisor per realm: a shared authserver is Enabled = false here, and a command naming it
+    # used to reach StartService() - one click on the wrong realm's page (or a hand-written control
+    # file) would start a SECOND authserver next to the one another supervisor owns. "ping" stays
+    # allowed: it only asks whether the control channel is alive.
+    $statusPath = Join-Path $supDir 'logs\supervisor_status.json'
+    $controlPath = Join-Path $supDir 'logs\supervisor_control.txt'
+    function Send-AuthCmd {
+        param([string]$Id, [string]$Action, [string]$Target)
+        $tmp = "$controlPath.tmp"
+        [System.IO.File]::WriteAllLines($tmp, @("id=$Id", "action=$Action", "target=$Target"))
+        Move-Item -Force $tmp $controlPath
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadline) {
+            if (Test-Path $statusPath) {
+                try { $j = Get-Content $statusPath -Raw | ConvertFrom-Json } catch { $j = $null }
+                if ($j -and $j.lastCommand -and $j.lastCommand.id -eq $Id) { return $j.lastCommand }
+            }
+            Start-Sleep -Milliseconds 300
+        }
+        return $null
+    }
+
+    Write-Host '[driver] waiting for the worldservice to finish startup'
+    Start-Sleep -Seconds 16
+    $disabledStatus = @((Get-Content $statusPath -Raw | ConvertFrom-Json).services | Where-Object { $_.name -eq 'authserver' })[0]
+
+    Write-Host '[driver] step 1: every command naming the disabled service must be rejected'
+    $adRestart = Send-AuthCmd -Id 'ad1' -Action 'restart' -Target 'authserver'
+    $adStart = Send-AuthCmd -Id 'ad2' -Action 'start' -Target 'authserver'
+    $adStop = Send-AuthCmd -Id 'ad3' -Action 'stop' -Target 'authserver'
+    $adShutdown = Send-AuthCmd -Id 'ad4' -Action 'shutdown' -Target 'authserver'
+    $adPing = Send-AuthCmd -Id 'ad5' -Action 'ping' -Target 'authserver'
+    Write-Host ("  -> restart={0} start={1} stop={2} shutdown={3} ping={4}" -f `
+        $(if ($adRestart) { $adRestart.result } else { 'none' }), $(if ($adStart) { $adStart.result } else { 'none' }), `
+        $(if ($adStop) { $adStop.result } else { 'none' }), $(if ($adShutdown) { $adShutdown.result } else { 'none' }), `
+        $(if ($adPing) { $adPing.result } else { 'none' }))
+    $adAliveAfterRejections = -not $sup.HasExited
+
+    Write-Host '[driver] step 2: a broadcast still restarts the service it owns'
+    $adWorldBefore = Count-Ledger $worldLedger '\[world\] START'
+    $adBroadcast = Send-AuthCmd -Id 'ad6' -Action 'restart' -Target 'all'
+    Start-Sleep -Seconds 8
+    $adWorldAfter = Count-Ledger $worldLedger '\[world\] START'
+    $adAuthStarts = Count-Ledger $authLedger '\[auth\] START'
+
+    $authDisabledVars = [ordered]@{
+        reportedEnabled = if ($disabledStatus) { $disabledStatus.enabled } else { $null }
+        restartResult = if ($adRestart) { [string]$adRestart.result } else { '' }
+        restartMessage = if ($adRestart) { [string]$adRestart.message } else { '' }
+        startResult = if ($adStart) { [string]$adStart.result } else { '' }
+        stopResult = if ($adStop) { [string]$adStop.result } else { '' }
+        shutdownResult = if ($adShutdown) { [string]$adShutdown.result } else { '' }
+        pingResult = if ($adPing) { [string]$adPing.result } else { '' }
+        broadcastResult = if ($adBroadcast) { [string]$adBroadcast.result } else { '' }
+        supervisorAlive = $adAliveAfterRejections
+        worldStartsBefore = $adWorldBefore
+        worldStartsAfter = $adWorldAfter
+        authStarts = $adAuthStarts
     }
 } else {
     Start-Sleep -Seconds $Seconds
@@ -448,6 +514,28 @@ switch ($Scenario) {
         Want (-not $wdAlive) 'supervisor shut down after the window closed'
         Want ($wGrace -ge 1 -and $aGrace -ge 1) 'both servers got the graceful shutdown signal'
         Want ($wProcs.Count -eq 0 -and $aProcs.Count -eq 0) 'no orphaned server after closing the window'
+    }
+    'authdisabled' {
+        Write-Host '--- disabled service (shared authserver) results ---' -ForegroundColor Cyan
+        Write-Host ("  reported enabled                  : {0}" -f $authDisabledVars.reportedEnabled)
+        Write-Host ("  restart/start/stop/shutdown       : {0} / {1} / {2} / {3}" -f $authDisabledVars.restartResult, $authDisabledVars.startResult, $authDisabledVars.stopResult, $authDisabledVars.shutdownResult)
+        Write-Host ("  ping                              : {0} (allowed on purpose)" -f $authDisabledVars.pingResult)
+        Write-Host ("  broadcast restart                 : {0}, world starts {1} -> {2}, auth starts {3}" -f $authDisabledVars.broadcastResult, $authDisabledVars.worldStartsBefore, $authDisabledVars.worldStartsAfter, $authDisabledVars.authStarts)
+        Write-Host ("  refusal message                   : {0}" -f $authDisabledVars.restartMessage)
+
+        Want ($authDisabledVars.reportedEnabled -eq $false) 'the ini-disabled service is reported as enabled=false'
+        Want ($authDisabledVars.restartResult -eq 'rejected') 'restart of a disabled service is rejected'
+        Want ($authDisabledVars.restartMessage -match 'disabled in this supervisor') 'the refusal says why'
+        Want ($authDisabledVars.startResult -eq 'rejected') 'start of a disabled service is rejected'
+        Want ($authDisabledVars.stopResult -eq 'rejected') 'stop of a disabled service is rejected'
+        Want ($authDisabledVars.shutdownResult -eq 'rejected') 'shutdown of a disabled service is rejected'
+        Want ($authDisabledVars.supervisorAlive) 'the supervisor is still alive after a shutdown aimed at a disabled service'
+        Want ($authDisabledVars.pingResult -eq 'ok') 'ping still answers (control-channel check, no service touched)'
+        Want ($authDisabledVars.authStarts -eq 0) 'the disabled service was never started'
+        Want ($aProcs.Count -eq 0) 'no process of the disabled service exists'
+        Want ($authDisabledVars.broadcastResult -eq 'ok') 'a broadcast is still accepted'
+        Want ($authDisabledVars.worldStartsAfter -gt $authDisabledVars.worldStartsBefore) 'the broadcast restarted the service this supervisor owns'
+        Want ($joined -match 'disabled in this supervisor') 'the refusal is in the supervisor log'
     }
     'control' {
         Write-Host '--- control channel results ---' -ForegroundColor Cyan

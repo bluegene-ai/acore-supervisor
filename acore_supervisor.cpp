@@ -47,7 +47,7 @@
 // ---------------------------------------------------------------------------------------------
 //  constants
 // ---------------------------------------------------------------------------------------------
-static const wchar_t* SUPERVISOR_VERSION = L"1.1.5";
+static const wchar_t* SUPERVISOR_VERSION = L"1.1.6";
 
 enum class Level { Info, Ok, Warn, Error, Stall, Debug };
 
@@ -1976,6 +1976,8 @@ static std::wstring ExecuteControlCommand(const std::wstring& id, const std::wst
     std::vector<int> targets;
     if (target == L"all")
     {
+        // a broadcast only touches the services THIS supervisor runs; a disabled one belongs to
+        // another supervisor (a shared authserver is Enabled = false in every realm but one)
         for (size_t i = 0; i < g_services.size(); ++i)
             if (g_services[i].cfg.Enabled) targets.push_back((int)i);
     }
@@ -1988,7 +1990,24 @@ static std::wstring ExecuteControlCommand(const std::wstring& id, const std::wst
     if (!actionOk)
         return L"rejected: unknown action '" + actionRaw + L"' (ping|start|stop|restart|shutdown)";
     if (targets.empty())
+    {
+        if (target == L"all")
+            return L"rejected: this supervisor runs no enabled service (check Enabled in its ini)";
+
         return L"rejected: unknown target '" + targetRaw + L"' (use a configured service name or all)";
+    }
+
+    // Naming a service this supervisor does not run must be an ERROR, never a silent action:
+    // StartService() would happily launch it, and on a machine where several realms share one
+    // authserver that means a SECOND authserver next to the one another supervisor owns (production
+    // 2026-09-24: one click on the wrong realm's page, or a hand-written control file, was enough).
+    // "ping" is exempt on purpose: it only asks whether the control channel is alive and touches no
+    // service.
+    if (target != L"all" && action != L"ping" && !g_services[(size_t)targets[0]].cfg.Enabled)
+    {
+        return L"rejected: '" + g_services[(size_t)targets[0]].cfg.Name +
+               L"' is disabled in this supervisor (Enabled = false) - another supervisor owns it";
+    }
 
     if (action == L"ping")
         return L"ok: control channel alive";
